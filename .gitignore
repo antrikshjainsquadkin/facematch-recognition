@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+sandbox/
+
+# Development / Cleanup Backups
+_cleanup_backup/
+*.tmp
+*.tmp_*
+
+# Model weights & archives
+models/
+*.onnx
+*.zip
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

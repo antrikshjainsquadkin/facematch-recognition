@@ -63,6 +63,85 @@ def compute_sharpness(crop: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+def check_face_quality(
+    frame: np.ndarray,
+    face: Any,
+    min_size: Tuple[int, int] = (config.REC_MIN_FACE_WIDTH, config.REC_MIN_FACE_HEIGHT),
+    min_sharpness: float = config.REC_MIN_SHARPNESS,
+    edge_margin: int = config.REC_EDGE_MARGIN_PX,
+) -> Tuple[bool, str]:
+    """Verify facial crop quality, rejecting blur, poor lighting, extreme angles, and edge clipping.
+
+    Args:
+        frame: Original full-resolution image/frame.
+        face: Detected InsightFace Face instance.
+        min_size: (min_width, min_height) required.
+        min_sharpness: Minimum Laplacian variance for blur rejection.
+        edge_margin: Minimum margin from frame boundaries.
+
+    Returns:
+        Tuple of (is_valid: bool, reason: str).
+    """
+    if frame is None or frame.size == 0 or face is None:
+        return False, "Invalid image data"
+
+    h_img, w_img = frame.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in face.bbox]
+    w = x2 - x1
+    h = y2 - y1
+
+    # 1. Edge boundary check (reject face clipped by frame borders)
+    if x1 <= edge_margin or y1 <= edge_margin or x2 >= (w_img - edge_margin) or y2 >= (h_img - edge_margin):
+        return False, "Face truncated at frame edge"
+
+    # 2. Minimum dimension check
+    min_w, min_h = min_size
+    if w < min_w or h < min_h:
+        return False, f"Face too small ({w}x{h} < {min_w}x{min_h})"
+
+    # 3. Safe face crop
+    x1_cl = max(0, x1)
+    y1_cl = max(0, y1)
+    x2_cl = min(w_img, x2)
+    y2_cl = min(h_img, y2)
+    crop = frame[y1_cl:y2_cl, x1_cl:x2_cl]
+    if crop is None or crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
+        return False, "Invalid face crop"
+
+    # 4. Lighting: Brightness & Contrast (evaluated first as low brightness degrades Laplacian response)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+    mean_val = float(np.mean(gray))
+    std_val = float(np.std(gray))
+
+    if mean_val < config.REC_MIN_BRIGHTNESS:
+        return False, f"Face underexposed ({mean_val:.1f} < {config.REC_MIN_BRIGHTNESS:.1f})"
+    if mean_val > config.REC_MAX_BRIGHTNESS:
+        return False, f"Face overexposed ({mean_val:.1f} > {config.REC_MAX_BRIGHTNESS:.1f})"
+    if std_val < config.REC_MIN_CONTRAST:
+        return False, f"Low contrast ({std_val:.1f} < {config.REC_MIN_CONTRAST:.1f})"
+
+    # 5. Blur / Sharpness check
+    sharpness = compute_sharpness(crop)
+    if sharpness < min_sharpness:
+        return False, f"Face blurry (sharpness {sharpness:.1f} < {min_sharpness:.1f})"
+
+    # 6. Extreme pose check (yaw asymmetry from 5 facial landmarks)
+    kps = getattr(face, "kps", None)
+    if kps is not None and len(kps) >= 5:
+        left_eye = kps[0]
+        right_eye = kps[1]
+        nose = kps[2]
+        eye_dist = float(np.linalg.norm(right_eye - left_eye))
+        if eye_dist > 5.0:
+            d_left = float(np.linalg.norm(nose - left_eye))
+            d_right = float(np.linalg.norm(nose - right_eye))
+            yaw_ratio = abs(d_left - d_right) / eye_dist
+            if yaw_ratio > config.REC_MAX_YAW_RATIO:
+                return False, f"Extreme head pose (yaw {yaw_ratio:.2f} > {config.REC_MAX_YAW_RATIO:.2f})"
+
+    return True, "Quality OK"
+
+
 def load_image_safely(file_path: Path) -> Optional[np.ndarray]:
     """Load an image from disk safely supporting Unicode / non-ASCII Windows paths.
 
@@ -524,17 +603,43 @@ class FaceEngine:
         Never alters registry or writes to storage. Returns the recognized identity
         only when cosine similarity meets the threshold; otherwise 'Unknown Person'.
         """
+        ident, score, _ = self.match_face_detailed(
+            embedding=embedding,
+            registry=registry,
+            threshold=threshold,
+            min_margin=config.MATCH_AMBIGUITY_MARGIN,
+        )
+        return ident, score
+
+    def match_face_detailed(
+        self,
+        embedding: np.ndarray,
+        registry: Dict[str, np.ndarray],
+        threshold: float = config.SIMILARITY_THRESHOLD,
+        min_margin: float = config.MATCH_AMBIGUITY_MARGIN,
+    ) -> Tuple[str, float, bool]:
+        """Detailed vectorized matching with ambiguity rejection.
+
+        Args:
+            embedding: Query face embedding vector.
+            registry: Registered identities dictionary.
+            threshold: Cosine similarity threshold.
+            min_margin: Minimum margin between top-1 and top-2 candidate to prevent identity ambiguity.
+
+        Returns:
+            Tuple of (identity_name, similarity_score, is_ambiguous).
+        """
         if not registry:
-            return "Unknown Person", 0.0
+            return "Unknown Person", 0.0, False
 
         self._update_matrix_cache(registry)
         if self._matrix_cache is None or len(self._matrix_names) == 0:
-            return "Unknown Person", 0.0
+            return "Unknown Person", 0.0, False
 
         # Ensure query embedding is unit-normalized for true cosine similarity
         norm = float(np.linalg.norm(embedding))
         if norm <= 1e-7:
-            return "Unknown Person", 0.0
+            return "Unknown Person", 0.0, False
         normed_emb = (embedding / norm).astype(np.float32) if abs(norm - 1.0) > 1e-4 else embedding.astype(np.float32)
 
         # Vectorized dot product against all N enrolled unit vectors in one fast call
@@ -542,7 +647,75 @@ class FaceEngine:
         best_idx = int(np.argmax(scores))
         best_score = float(scores[best_idx])
 
-        if best_score >= threshold:
-            return self._matrix_names[best_idx], best_score
+        if best_score < threshold:
+            return "Unknown Person", max(0.0, best_score), False
 
-        return "Unknown Person", max(0.0, best_score)
+        # Check for ambiguity if multiple identities are enrolled
+        if len(self._matrix_names) > 1:
+            sorted_indices = np.argsort(scores)[::-1]
+            top1_score = float(scores[sorted_indices[0]])
+            top2_score = float(scores[sorted_indices[1]])
+            if top2_score >= (threshold - 0.05) and (top1_score - top2_score) < min_margin:
+                # Top match cannot be decisively separated from the second match
+                return "Unknown Person", top1_score, True
+
+        return self._matrix_names[best_idx], best_score, False
+
+    def match_faces_batch(
+        self,
+        embeddings: List[np.ndarray],
+        registry: Dict[str, np.ndarray],
+        threshold: float = config.SIMILARITY_THRESHOLD,
+        min_margin: float = config.MATCH_AMBIGUITY_MARGIN,
+    ) -> List[Tuple[str, float, bool]]:
+        """Match multiple detected face embeddings in a single optimized BLAS matrix multiplication.
+
+        Args:
+            embeddings: List of 512-D face embedding vectors.
+            registry: Registered identities dictionary.
+            threshold: Cosine similarity threshold.
+            min_margin: Margin required between top-1 and top-2 candidate.
+
+        Returns:
+            List of (identity_name, similarity_score, is_ambiguous) for each embedding.
+        """
+        if not embeddings or not registry:
+            return [("Unknown Person", 0.0, False) for _ in embeddings]
+
+        self._update_matrix_cache(registry)
+        if self._matrix_cache is None or len(self._matrix_names) == 0:
+            return [("Unknown Person", 0.0, False) for _ in embeddings]
+
+        # Stack and normalize query embeddings: shape (M, 512)
+        query_matrix = np.stack(embeddings).astype(np.float32)
+        norms = np.linalg.norm(query_matrix, axis=1, keepdims=True)
+        norms[norms <= 1e-7] = 1.0
+        query_matrix /= norms
+
+        # Single BLAS matrix product: (M, 512) x (512, N) -> (M, N)
+        scores_matrix = np.dot(query_matrix, self._matrix_cache.T)
+
+        results = []
+        for i in range(len(embeddings)):
+            row_scores = scores_matrix[i]
+            best_idx = int(np.argmax(row_scores))
+            best_score = float(row_scores[best_idx])
+
+            if best_score < threshold:
+                results.append(("Unknown Person", max(0.0, best_score), False))
+                continue
+
+            is_ambiguous = False
+            if len(self._matrix_names) > 1:
+                sorted_indices = np.argsort(row_scores)[::-1]
+                top1_score = float(row_scores[sorted_indices[0]])
+                top2_score = float(row_scores[sorted_indices[1]])
+                if top2_score >= (threshold - 0.05) and (top1_score - top2_score) < min_margin:
+                    is_ambiguous = True
+
+            if is_ambiguous:
+                results.append(("Unknown Person", best_score, True))
+            else:
+                results.append((self._matrix_names[best_idx], best_score, False))
+
+        return results

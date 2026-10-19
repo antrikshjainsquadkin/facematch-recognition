@@ -5,13 +5,15 @@ Supports:
 2. Register Face from Image (Upload image with strict quality checks).
 3. Recognize Face (Live Webcam with tolerant recognition for low-light/small faces).
 4. Recognize Face from Video File (Processes recorded/low-quality video files).
-5. List Registered People (from faces.json).
-6. Delete Registered Person (from faces.json).
-7. Exit.
+5. Recognize Face (Office Camera / IP Stream from RTSP/HTTP with zero buffer lag).
+6. List Registered People (from faces.json).
+7. Delete Registered Person (from faces.json).
+8. Exit.
 """
 
 import sys
 import time
+import getpass
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,7 +21,23 @@ import cv2
 import numpy as np
 
 import config
-from face_engine import FaceEngine, load_faces_from_json, save_faces_to_json, load_image_safely
+from face_engine import (
+    FaceEngine,
+    load_faces_from_json,
+    save_faces_to_json,
+    load_image_safely,
+    check_face_quality,
+)
+from camera_stream import (
+    RTSPStreamReader,
+    mask_stream_credentials,
+    build_rtsp_url,
+    test_rtsp_connection,
+    load_cctv_config,
+    save_cctv_config,
+    clear_cctv_config,
+)
+from temporal_tracker import TemporalRecognitionTracker
 
 
 def open_camera(camera_index: int = config.CAMERA_INDEX) -> Optional[cv2.VideoCapture]:
@@ -396,41 +414,8 @@ def draw_face_annotation(
     )
 
 
-def identify_face(
-    engine: FaceEngine,
-    face: Any,
-    registry: Dict[str, np.ndarray],
-) -> Tuple[Tuple[int, int, int, int], Tuple[int, int, int], str, str]:
-    """Compare a detected face against registered identities and format display properties.
-
-    Returns:
-        Tuple of ((x1, y1, x2, y2), box_color, label_text, identity_name).
-    """
-    x1, y1, x2, y2 = [int(v) for v in face.bbox]
-    embedding = face.normed_embedding
-    if embedding is None:
-        raw_emb = face.embedding
-        norm = float(np.linalg.norm(raw_emb))
-        if norm > 0:
-            embedding = (raw_emb / norm).astype(np.float32)
-
-    if embedding is not None:
-        identity, score = engine.match_face(embedding, registry)
-    else:
-        identity, score = "Unknown Person", 0.0
-
-    if identity != "Unknown Person":
-        box_color = (0, 255, 0)      # Green
-        label_text = f"{identity} (Sim: {score:.2f})"
-    else:
-        box_color = (0, 0, 255)      # Red
-        label_text = f"Unknown Person (Sim: {score:.2f})"
-
-    return (x1, y1, x2, y2), box_color, label_text, identity
-
-
 def recognize_faces(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None:
-    """Run real-time facial recognition on webcam with tolerant detection for lower-quality inputs.
+    """Run real-time facial recognition on webcam with temporal confirmation and quality filtering.
 
     Args:
         engine: FaceEngine instance.
@@ -451,6 +436,7 @@ def recognize_faces(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None
     print("Press [Q] in the camera window to stop recognition and return to the menu.\n")
 
     frame_count = 0
+    tracker = TemporalRecognitionTracker()
     cached_results: List[Tuple[Tuple[int, int, int, int], Tuple[int, int, int], str]] = []
 
     # Real-time processing FPS tracker
@@ -459,8 +445,6 @@ def recognize_faces(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None
 
     try:
         while True:
-            t_frame_start = time.perf_counter()
-
             ret, frame = cap.read()
             if not ret or frame is None:
                 print("[Error] Failed to read frame from webcam.")
@@ -470,9 +454,7 @@ def recognize_faces(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None
             h, w = display_frame.shape[:2]
             frame_count += 1
 
-            # Tolerant recognition detection (detects smaller/low-light faces)
             if frame_count % config.PROCESS_EVERY_N_FRAMES == 0 or not cached_results:
-                new_results = []
                 faces = engine.detect_faces(
                     display_frame,
                     scale=config.INFERENCE_SCALE,
@@ -480,9 +462,51 @@ def recognize_faces(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None
                     min_size=(config.REC_MIN_FACE_WIDTH, config.REC_MIN_FACE_HEIGHT),
                 )
 
+                raw_detections = []
+                quality_tags: Dict[Tuple[int, int, int, int], str] = {}
+
                 for face in faces:
-                    bbox, box_color, label_text, _ = identify_face(engine, face, registry)
-                    new_results.append((bbox, box_color, label_text))
+                    bx1, by1, bx2, by2 = [int(v) for v in face.bbox]
+                    bbox = (bx1, by1, bx2, by2)
+                    is_ok, reason = check_face_quality(display_frame, face)
+
+                    if not is_ok:
+                        quality_tags[bbox] = reason
+                        raw_detections.append((bbox, "Unknown Person", 0.0, False))
+                        continue
+
+                    emb = face.normed_embedding
+                    if emb is None and face.embedding is not None:
+                        norm = float(np.linalg.norm(face.embedding))
+                        emb = (face.embedding / norm).astype(np.float32) if norm > 0 else None
+
+                    if emb is not None:
+                        ident, score, is_amb = engine.match_face_detailed(emb, registry)
+                        raw_detections.append((bbox, ident, score, is_amb))
+                    else:
+                        raw_detections.append((bbox, "Unknown Person", 0.0, False))
+
+                tracked_results = tracker.update(raw_detections)
+                new_results = []
+
+                for bbox, stab_id, score, is_confirmed, is_new_event in tracked_results:
+                    if is_new_event:
+                        print(f"[FaceMatch Event] Recognized: {stab_id} (Confidence: {score:.2f})")
+
+                    if bbox in quality_tags:
+                        box_color = (0, 165, 255)  # Orange
+                        label = f"Low Quality ({quality_tags[bbox]})"
+                    elif is_confirmed:
+                        box_color = (0, 255, 0)    # Green
+                        label = f"{stab_id} (Sim: {score:.2f})"
+                    elif stab_id.startswith("Verifying"):
+                        box_color = (0, 255, 255)  # Yellow
+                        label = f"{stab_id} ({score:.2f})"
+                    else:
+                        box_color = (0, 0, 255)    # Red
+                        label = f"Unknown Person (Sim: {score:.2f})"
+
+                    new_results.append((bbox, box_color, label))
 
                 cached_results = new_results
 
@@ -521,7 +545,7 @@ def recognize_faces(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None
 
 
 def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None:
-    """Run face recognition on a recorded video file with tolerant settings and accurate FPS reporting.
+    """Run face recognition on a recorded video file with temporal confirmation and quality reporting.
 
     Args:
         engine: FaceEngine instance.
@@ -563,6 +587,7 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
 
     frame_idx = 0
     paused = False
+    tracker = TemporalRecognitionTracker()
     cached_results: List[Tuple[Tuple[int, int, int, int], Tuple[int, int, int], str]] = []
     total_detections = 0
     total_inferences = 0
@@ -582,10 +607,8 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
                     break
                 frame_idx += 1
 
-                # Full-resolution or scaled tolerant detection for recorded video analysis
                 if frame_idx % config.PROCESS_EVERY_N_FRAMES == 0 or not cached_results:
                     total_inferences += 1
-                    new_results = []
                     faces = engine.detect_faces(
                         frame,
                         scale=config.REC_INFERENCE_SCALE,
@@ -593,11 +616,51 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
                         min_size=(config.REC_MIN_FACE_WIDTH, config.REC_MIN_FACE_HEIGHT),
                     )
 
+                    raw_detections = []
+                    quality_tags = {}
                     for face in faces:
                         total_detections += 1
-                        bbox, box_color, label_text, identity = identify_face(engine, face, registry)
-                        match_counts[identity] = match_counts.get(identity, 0) + 1
-                        new_results.append((bbox, box_color, label_text))
+                        bx1, by1, bx2, by2 = [int(v) for v in face.bbox]
+                        bbox = (bx1, by1, bx2, by2)
+                        is_ok, reason = check_face_quality(frame, face)
+
+                        if not is_ok:
+                            quality_tags[bbox] = reason
+                            raw_detections.append((bbox, "Unknown Person", 0.0, False))
+                            continue
+
+                        emb = face.normed_embedding
+                        if emb is None and face.embedding is not None:
+                            norm = float(np.linalg.norm(face.embedding))
+                            emb = (face.embedding / norm).astype(np.float32) if norm > 0 else None
+
+                        if emb is not None:
+                            ident, score, is_amb = engine.match_face_detailed(emb, registry)
+                            raw_detections.append((bbox, ident, score, is_amb))
+                        else:
+                            raw_detections.append((bbox, "Unknown Person", 0.0, False))
+
+                    tracked = tracker.update(raw_detections)
+                    new_results = []
+                    for bbox, stab_id, score, is_confirmed, is_new_event in tracked:
+                        if is_confirmed and stab_id != "Unknown Person":
+                            match_counts[stab_id] = match_counts.get(stab_id, 0) + 1
+                        elif not is_confirmed and not stab_id.startswith("Verifying"):
+                            match_counts["Unknown Person"] = match_counts.get("Unknown Person", 0) + 1
+
+                        if bbox in quality_tags:
+                            box_color = (0, 165, 255)
+                            label = f"Low Quality ({quality_tags[bbox]})"
+                        elif is_confirmed:
+                            box_color = (0, 255, 0)
+                            label = f"{stab_id} (Sim: {score:.2f})"
+                        elif stab_id.startswith("Verifying"):
+                            box_color = (0, 255, 255)
+                            label = f"{stab_id} ({score:.2f})"
+                        else:
+                            box_color = (0, 0, 255)
+                            label = f"Unknown Person (Sim: {score:.2f})"
+                        new_results.append((bbox, box_color, label))
 
                     cached_results = new_results
 
@@ -627,16 +690,14 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
 
             cv2.imshow(config.WINDOW_TITLE, display_frame)
 
-            # Pace playback smoothly according to video's native delay
             wait_time = max(1, int(delay_ms - proc_time_ms)) if not paused else 50
             key = cv2.waitKey(wait_time) & 0xFF
             if key in (ord("q"), ord("Q"), 27):
                 print("Video recognition stopped by user.")
                 break
-            elif key == 32:  # SPACE to pause/resume
+            elif key == 32:
                 paused = not paused
 
-        # Summary report
         total_time_elapsed = max(0.001, time.perf_counter() - t_video_start)
         avg_processing_fps = frame_idx / total_time_elapsed
 
@@ -651,7 +712,7 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
         if match_counts:
             print(" Identities Detected:")
             for ident, cnt in sorted(match_counts.items(), key=lambda x: -x[1]):
-                print(f"  - {ident:<22}: {cnt} detections")
+                print(f"  - {ident:<22}: {cnt} frames/detections")
         else:
             print(" No faces detected in video.")
         print("===========================================================\n")
@@ -659,6 +720,358 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
     finally:
         cap.release()
         cv2.destroyAllWindows()
+
+
+def prompt_cctv_five_inputs(existing: Optional[Dict[str, Any]] = None) -> Tuple[str, str, str, str, str]:
+    """Prompt the user for exactly the five CCTV connection values.
+
+    1. Username
+    2. Password (masked)
+    3. IP Address
+    4. Port
+    5. Stream Path
+
+    Args:
+        existing: Optional dictionary of existing/saved settings.
+
+    Returns:
+        Tuple of (username, password, ip_address, port, stream_path).
+    """
+    print("\n--------------------------------------------------")
+    print("      Enter CCTV Camera Connection Values (5 Inputs)")
+    print("--------------------------------------------------")
+    print("Please enter the 5 camera values:")
+
+    existing = existing or {}
+    ex_user = existing.get("username", "")
+    ex_ip = existing.get("ip_address", "")
+    ex_port = str(existing.get("port", config.DEFAULT_RTSP_PORT))
+    ex_path = existing.get("stream_path", "")
+    has_pwd = bool(existing.get("password"))
+
+    # 1. Username
+    u_prompt = f"1. Username [{ex_user}]: " if ex_user else "1. Username: "
+    username = input(u_prompt).strip()
+    if not username and ex_user:
+        username = ex_user
+
+    # 2. Password (masked)
+    p_prompt = "2. Password [Press Enter to keep existing password]: " if has_pwd else "2. Password: "
+    try:
+        password = getpass.getpass(p_prompt).strip()
+    except Exception:
+        password = input(p_prompt).strip()
+    if not password and has_pwd:
+        password = existing.get("password", "")
+
+    # 3. IP Address
+    ip_prompt = f"3. IP Address [{ex_ip}]: " if ex_ip else "3. IP Address: "
+    ip_address = input(ip_prompt).strip()
+    if not ip_address and ex_ip:
+        ip_address = ex_ip
+
+    # 4. Port
+    port_prompt = f"4. Port [{ex_port}]: "
+    port_raw = input(port_prompt).strip()
+    port = port_raw if port_raw else ex_port
+
+    # 5. Stream Path
+    path_prompt = f"5. Stream Path [{ex_path}]: " if ex_path else "5. Stream Path (e.g. /live/ch0): "
+    stream_path = input(path_prompt).strip()
+    if not stream_path and ex_path:
+        stream_path = ex_path
+
+    return username, password, ip_address, port, stream_path
+
+
+def cctv_camera_menu(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None:
+    """Dedicated interface for CCTV camera setup, testing, recognition, and credential management.
+
+    Allows configuration using exactly the 5 inputs:
+    Username, Password, IP Address, Port, Stream Path.
+    Provides clear action controls:
+    - Test Connection
+    - Connect and Recognize
+    - Edit Connection Values
+    - Remove Saved Credentials
+    - Return to Main Menu
+
+    Args:
+        engine: FaceEngine instance.
+        registry: In-memory dictionary mapping names to embedding vectors.
+    """
+    saved_cfg = load_cctv_config() or {}
+
+    # If no configuration exists yet, prompt immediately
+    if not saved_cfg.get("ip_address"):
+        user, pwd, ip, port, path = prompt_cctv_five_inputs(saved_cfg)
+        if not ip:
+            print("[Error] IP address is required to connect to camera.")
+            return
+
+        saved_cfg = {
+            "username": user,
+            "password": pwd,
+            "ip_address": ip,
+            "port": port,
+            "stream_path": path,
+        }
+
+        save_choice = input("Do you want to save these settings locally in gitignored file? (y/n): ").strip().lower()
+        if save_choice in ("y", "yes"):
+            save_cctv_config(saved_cfg)
+            print("Settings saved locally to gitignored config.")
+
+    active_backend = saved_cfg.get("video_backend", config.DEFAULT_VIDEO_BACKEND)
+
+    while True:
+        user = saved_cfg.get("username", "")
+        pwd = saved_cfg.get("password", "")
+        ip = saved_cfg.get("ip_address", "")
+        port = saved_cfg.get("port", config.DEFAULT_RTSP_PORT)
+        path = saved_cfg.get("stream_path", "")
+
+        rtsp_url = build_rtsp_url(user, pwd, ip, port, path)
+        masked_url = mask_stream_credentials(rtsp_url)
+
+        print("\n==================================================")
+        print("     CCTV Camera Connection (RTSP / DVR / NVR)     ")
+        print("==================================================")
+        print("Current Camera Configuration:")
+        print(f"  1. Username      : {user or '(none)'}")
+        print(f"  2. Password      : {'********' if pwd else '(none)'}")
+        print(f"  3. IP Address    : {ip}")
+        print(f"  4. Port          : {port}")
+        print(f"  5. Stream Path   : {path or '/'}")
+        print(f"  6. Video Backend : {active_backend.upper()} (Auto: PyAV preferred for RTSP, OpenCV fallback)")
+        print(f"  Constructed URL  : {masked_url}")
+        print("--------------------------------------------------")
+        print("Actions:")
+        print("  [T] Test Connection (Verify recorder reachability & frame grab)")
+        print("  [C] Connect and Recognize (Start live face recognition)")
+        print("  [S] Switch Video Backend (Auto / PyAV / OpenCV)")
+        print("  [E] Edit Connection Values (Update the 5 inputs)")
+        print("  [R] Remove Saved Credentials (Delete local config file)")
+        print("  [B] Back to Main Menu")
+        print("==================================================")
+
+        act = input("Select action (T/C/S/E/R/B): ").strip().lower()
+
+        if act in ("t", "test"):
+            print(f"\n[Test Connection] Connecting via {active_backend.upper()} to {masked_url}...")
+            ok, msg, res = test_rtsp_connection(rtsp_url, backend=active_backend)
+            if ok:
+                print(f"[Success] {msg}")
+            else:
+                print(f"[Connection Failed] {msg}")
+
+        elif act in ("s", "switch", "backend"):
+            backend_cycle = {"auto": "pyav", "pyav": "opencv", "opencv": "auto"}
+            active_backend = backend_cycle.get(active_backend, "auto")
+            saved_cfg["video_backend"] = active_backend
+            save_choice = input(f"Switched backend to {active_backend.upper()}. Save as default in config? (y/n): ").strip().lower()
+            if save_choice in ("y", "yes"):
+                save_cctv_config(saved_cfg)
+                print("Default video backend saved.")
+
+        elif act in ("c", "connect"):
+            if not registry:
+                print("\n[Notice] No registered people found.")
+                print(f"Please register at least one face (Option 1 or Option 2) so it is saved to '{config.FACES_JSON_PATH.name}'.")
+                continue
+
+            run_cctv_recognition(engine, registry, rtsp_url, backend=active_backend)
+
+        elif act in ("e", "edit"):
+            new_user, new_pwd, new_ip, new_port, new_path = prompt_cctv_five_inputs(saved_cfg)
+            if new_ip:
+                saved_cfg = {
+                    "username": new_user,
+                    "password": new_pwd,
+                    "ip_address": new_ip,
+                    "port": new_port,
+                    "stream_path": new_path,
+                }
+                save_choice = input("Update saved local config? (y/n): ").strip().lower()
+                if save_choice in ("y", "yes"):
+                    save_cctv_config(saved_cfg)
+                    print("Updated settings saved.")
+
+        elif act in ("r", "remove"):
+            confirm = input("Are you sure you want to remove saved CCTV credentials? (y/n): ").strip().lower()
+            if confirm in ("y", "yes"):
+                clear_cctv_config()
+                saved_cfg = {}
+                print("Saved CCTV credentials removed.")
+                break
+
+        elif act in ("b", "back", "q", "exit"):
+            break
+        else:
+            print("[Invalid Action] Please select T, C, E, R, or B.")
+
+
+def run_cctv_recognition(
+    engine: FaceEngine,
+    registry: Dict[str, np.ndarray],
+    rtsp_url: str,
+    backend: str = config.DEFAULT_VIDEO_BACKEND,
+) -> None:
+    """Run live real-time face recognition from an RTSP camera stream.
+
+    Applies:
+    - Decoupled hybrid frame-grabber (PyAV direct FFmpeg or OpenCV fallback).
+    - Temporal confirmation tracker to eliminate false acceptances.
+    - Continuous appearance tracking with duplicate event suppression.
+    - Face quality filtering (blur, darkness, extreme pose, edge truncation).
+    - Masked URL display protecting sensitive credentials.
+
+    Args:
+        engine: FaceEngine instance.
+        registry: In-memory dictionary mapping names to embedding vectors.
+        rtsp_url: Complete constructed RTSP URL.
+        backend: "auto", "pyav", or "opencv".
+    """
+    masked_url = mask_stream_credentials(rtsp_url)
+    print(f"\n[CCTV Camera] Connecting to: {masked_url} (Backend: {backend.upper()})")
+    print("Controls:")
+    print(" - Press [Q] or [ESC] in the camera window to Disconnect and return.\n")
+
+    engine.ensure_ready()
+
+    reader = RTSPStreamReader(
+        stream_url=rtsp_url,
+        backend=backend,
+        transport=config.RTSP_TRANSPORT,
+        timeout_sec=config.STREAM_TIMEOUT_SEC,
+        reconnect_interval_sec=config.STREAM_RECONNECT_INTERVAL_SEC,
+        max_reconnect_attempts=config.STREAM_MAX_RECONNECT_ATTEMPTS,
+    )
+    reader.start()
+
+    tracker = TemporalRecognitionTracker()
+    frame_count = 0
+    cached_results: List[Tuple[Tuple[int, int, int, int], Tuple[int, int, int], str]] = []
+    fps_smooth = 0.0
+    t_prev_frame = time.perf_counter()
+
+    try:
+        # Give stream grabber a moment to establish connection
+        init_wait_start = time.perf_counter()
+        while reader._running and time.perf_counter() - init_wait_start < 4.0:
+            valid, _, _ = reader.read()
+            if valid:
+                break
+            time.sleep(0.05)
+
+        while True:
+            valid, frame, status = reader.read()
+            if not valid or frame is None:
+                if not reader._running or "Failed" in status or "Unable" in status:
+                    print(f"\n[CCTV Connection Status] {status}")
+                    break
+                time.sleep(0.03)
+                continue
+
+            display_frame = frame
+            h, w = display_frame.shape[:2]
+            frame_count += 1
+
+            if frame_count % config.PROCESS_EVERY_N_FRAMES == 0 or not cached_results:
+                faces = engine.detect_faces(
+                    display_frame,
+                    scale=config.REC_INFERENCE_SCALE,
+                    min_score=config.REC_MIN_DET_SCORE,
+                    min_size=(config.REC_MIN_FACE_WIDTH, config.REC_MIN_FACE_HEIGHT),
+                )
+
+                raw_detections = []
+                quality_tags = {}
+
+                for face in faces:
+                    bx1, by1, bx2, by2 = [int(v) for v in face.bbox]
+                    bbox = (bx1, by1, bx2, by2)
+                    is_ok, reason = check_face_quality(display_frame, face)
+
+                    if not is_ok:
+                        quality_tags[bbox] = reason
+                        raw_detections.append((bbox, "Unknown Person", 0.0, False))
+                        continue
+
+                    emb = face.normed_embedding
+                    if emb is None and face.embedding is not None:
+                        norm = float(np.linalg.norm(face.embedding))
+                        emb = (face.embedding / norm).astype(np.float32) if norm > 0 else None
+
+                    if emb is not None:
+                        ident, score, is_amb = engine.match_face_detailed(emb, registry)
+                        raw_detections.append((bbox, ident, score, is_amb))
+                    else:
+                        raw_detections.append((bbox, "Unknown Person", 0.0, False))
+
+                tracked = tracker.update(raw_detections)
+                new_results = []
+
+                for bbox, stab_id, score, is_confirmed, is_new_event in tracked:
+                    if is_new_event:
+                        print(f"[FaceMatch Event] Recognized: {stab_id} (Confidence: {score:.2f})")
+
+                    if bbox in quality_tags:
+                        box_color = (0, 165, 255)  # Orange
+                        label = f"Low Quality ({quality_tags[bbox]})"
+                    elif is_confirmed:
+                        box_color = (0, 255, 0)    # Green
+                        label = f"{stab_id} (Sim: {score:.2f})"
+                    elif stab_id.startswith("Verifying"):
+                        box_color = (0, 255, 255)  # Yellow
+                        label = f"{stab_id} ({score:.2f})"
+                    else:
+                        box_color = (0, 0, 255)    # Red
+                        label = f"Unknown Person (Sim: {score:.2f})"
+
+                    new_results.append((bbox, box_color, label))
+
+                cached_results = new_results
+
+            for bbox, box_color, label_text in cached_results:
+                draw_face_annotation(display_frame, bbox, box_color, label_text)
+
+            t_now = time.perf_counter()
+            dt = t_now - t_prev_frame
+            t_prev_frame = t_now
+            inst_fps = 1.0 / dt if dt > 0 else 0.0
+            fps_smooth = 0.85 * fps_smooth + 0.15 * inst_fps if fps_smooth > 0 else inst_fps
+
+            # Header banner with sanitized stream name and live processing FPS
+            cv2.rectangle(display_frame, (0, 0), (w, 32), (30, 30, 30), -1)
+            cv2.putText(
+                display_frame,
+                f"CCTV [{reader.active_backend}]: {masked_url} | Enrolled: {len(registry)} | Live: {fps_smooth:.1f} FPS | [Q] Disconnect",
+                (10, 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+            cv2.imshow(config.WINDOW_TITLE, display_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("Q"), 27):
+                print("Disconnecting from CCTV camera and releasing resources...")
+                break
+    finally:
+        reader.disconnect()
+        cv2.destroyAllWindows()
+
+
+def recognize_from_office_camera(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None:
+    """Run real-time face recognition from an authorized office camera or IP stream.
+
+    Maintained for full backwards compatibility; redirects to the 5-field CCTV interface.
+    """
+    cctv_camera_menu(engine, registry)
 
 
 def list_registered_identities(registry: Dict[str, np.ndarray]) -> None:
@@ -742,9 +1155,10 @@ def display_menu() -> None:
     print("2. Register Face from Image")
     print("3. Recognize Face (Live Webcam)")
     print("4. Recognize Face from Video File")
-    print("5. List Registered People")
-    print("6. Delete Registered Person")
-    print("7. Exit")
+    print("5. CCTV Camera (5-Field Setup, Test & Recognize)")
+    print("6. List Registered People")
+    print("7. Delete Registered Person")
+    print("8. Exit")
     print("==========================================")
 
 
@@ -774,7 +1188,7 @@ def main() -> None:
     while True:
         try:
             display_menu()
-            choice = input("Enter choice (1-7): ").strip()
+            choice = input("Enter choice (1-8): ").strip()
 
             if choice == "1":
                 register_face(engine, registry)
@@ -785,14 +1199,16 @@ def main() -> None:
             elif choice == "4":
                 recognize_from_video_file(engine, registry)
             elif choice == "5":
-                list_registered_identities(registry)
+                recognize_from_office_camera(engine, registry)
             elif choice == "6":
-                delete_registered_identity(engine, registry)
+                list_registered_identities(registry)
             elif choice == "7":
+                delete_registered_identity(engine, registry)
+            elif choice == "8":
                 print("\nExiting FaceMatch. Goodbye!")
                 break
             else:
-                print("\n[Invalid Option] Please enter a number between 1 and 7.")
+                print("\n[Invalid Option] Please enter a number between 1 and 8.")
         except KeyboardInterrupt:
             print("\n\nOperation interrupted by user (Ctrl+C). Exiting FaceMatch...")
             break

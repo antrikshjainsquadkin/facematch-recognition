@@ -25,3 +25,8 @@ models/
 .idea/
 .DS_Store
 Thumbs.db
+
+# CCTV & Local Secrets
+.cctv_config.json
+*.credential*
+*.env

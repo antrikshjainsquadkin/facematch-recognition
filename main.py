@@ -27,6 +27,7 @@ from face_engine import (
     save_faces_to_json,
     load_image_safely,
     check_face_quality,
+    compute_mask_probability,
 )
 from camera_stream import (
     RTSPStreamReader,
@@ -468,11 +469,12 @@ def recognize_faces(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None
                 for face in faces:
                     bx1, by1, bx2, by2 = [int(v) for v in face.bbox]
                     bbox = (bx1, by1, bx2, by2)
+                    is_masked = getattr(face, "is_masked", False)
                     is_ok, reason = check_face_quality(display_frame, face)
 
                     if not is_ok:
                         quality_tags[bbox] = reason
-                        raw_detections.append((bbox, "Unknown Person", 0.0, False))
+                        raw_detections.append((bbox, "Unknown Person", 0.0, False, is_masked))
                         continue
 
                     emb = face.normed_embedding
@@ -481,30 +483,42 @@ def recognize_faces(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None
                         emb = (face.embedding / norm).astype(np.float32) if norm > 0 else None
 
                     if emb is not None:
-                        ident, score, is_amb = engine.match_face_detailed(emb, registry)
-                        raw_detections.append((bbox, ident, score, is_amb))
+                        ident, score, is_amb = engine.match_face_detailed(emb, registry, is_masked=is_masked)
+                        raw_detections.append((bbox, ident, score, is_amb, is_masked))
                     else:
-                        raw_detections.append((bbox, "Unknown Person", 0.0, False))
+                        unknown_id = "Unknown Person " if is_masked else "Unknown Person"
+                        raw_detections.append((bbox, unknown_id, 0.0, False, is_masked))
 
                 tracked_results = tracker.update(raw_detections)
                 new_results = []
 
-                for bbox, stab_id, score, is_confirmed, is_new_event in tracked_results:
+                for item in tracked_results:
+                    bbox, stab_id, score, is_confirmed, is_new_event = item[:5]
+                    is_masked = bool(item[5]) if len(item) >= 6 else False
+
                     if is_new_event:
+                        mask_badge = " " if is_masked else ""
                         print(f"[FaceMatch Event] Recognized: {stab_id} (Confidence: {score:.2f})")
 
                     if bbox in quality_tags:
                         box_color = (0, 165, 255)  # Orange
                         label = f"Low Quality ({quality_tags[bbox]})"
                     elif is_confirmed:
-                        box_color = (0, 255, 0)    # Green
-                        label = f"{stab_id} (Sim: {score:.2f})"
+                        if is_masked:
+                            box_color = (255, 200, 0)  # Cyan/Teal for recognized masked face
+                            label = f"{stab_id} (Sim: {score:.2f})"
+                        else:
+                            box_color = (0, 255, 0)    # Green
+                            label = f"{stab_id} (Sim: {score:.2f})"
                     elif stab_id.startswith("Verifying"):
                         box_color = (0, 255, 255)  # Yellow
                         label = f"{stab_id} ({score:.2f})"
                     else:
                         box_color = (0, 0, 255)    # Red
-                        label = f"Unknown Person (Sim: {score:.2f})"
+                        if is_masked:
+                            label = f"Unknown Person  (Sim: {score:.2f})"
+                        else:
+                            label = f"Unknown Person (Sim: {score:.2f})"
 
                     new_results.append((bbox, box_color, label))
 
@@ -622,11 +636,12 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
                         total_detections += 1
                         bx1, by1, bx2, by2 = [int(v) for v in face.bbox]
                         bbox = (bx1, by1, bx2, by2)
+                        is_masked = getattr(face, "is_masked", False)
                         is_ok, reason = check_face_quality(frame, face)
 
                         if not is_ok:
                             quality_tags[bbox] = reason
-                            raw_detections.append((bbox, "Unknown Person", 0.0, False))
+                            raw_detections.append((bbox, "Unknown Person", 0.0, False, is_masked))
                             continue
 
                         emb = face.normed_embedding
@@ -635,16 +650,21 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
                             emb = (face.embedding / norm).astype(np.float32) if norm > 0 else None
 
                         if emb is not None:
-                            ident, score, is_amb = engine.match_face_detailed(emb, registry)
-                            raw_detections.append((bbox, ident, score, is_amb))
+                            ident, score, is_amb = engine.match_face_detailed(emb, registry, is_masked=is_masked)
+                            raw_detections.append((bbox, ident, score, is_amb, is_masked))
                         else:
-                            raw_detections.append((bbox, "Unknown Person", 0.0, False))
+                            unknown_id = "Unknown Person" if is_masked else "Unknown Person"
+                            raw_detections.append((bbox, unknown_id, 0.0, False, is_masked))
 
                     tracked = tracker.update(raw_detections)
                     new_results = []
-                    for bbox, stab_id, score, is_confirmed, is_new_event in tracked:
-                        if is_confirmed and stab_id != "Unknown Person":
-                            match_counts[stab_id] = match_counts.get(stab_id, 0) + 1
+                    for item in tracked:
+                        bbox, stab_id, score, is_confirmed, is_new_event = item[:5]
+                        is_masked = bool(item[5]) if len(item) >= 6 else False
+
+                        if is_confirmed and not stab_id.startswith("Unknown Person"):
+                            match_key = f"{stab_id}" if is_masked else stab_id
+                            match_counts[match_key] = match_counts.get(match_key, 0) + 1
                         elif not is_confirmed and not stab_id.startswith("Verifying"):
                             match_counts["Unknown Person"] = match_counts.get("Unknown Person", 0) + 1
 
@@ -652,14 +672,21 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
                             box_color = (0, 165, 255)
                             label = f"Low Quality ({quality_tags[bbox]})"
                         elif is_confirmed:
-                            box_color = (0, 255, 0)
-                            label = f"{stab_id} (Sim: {score:.2f})"
+                            if is_masked:
+                                box_color = (255, 200, 0)  # Cyan/Teal
+                                label = f"{stab_id} (Sim: {score:.2f})"
+                            else:
+                                box_color = (0, 255, 0)    # Green
+                                label = f"{stab_id} (Sim: {score:.2f})"
                         elif stab_id.startswith("Verifying"):
                             box_color = (0, 255, 255)
                             label = f"{stab_id} ({score:.2f})"
                         else:
                             box_color = (0, 0, 255)
-                            label = f"Unknown Person (Sim: {score:.2f})"
+                            if is_masked:
+                                label = f"Unknown Person (Sim: {score:.2f})"
+                            else:
+                                label = f"Unknown Person (Sim: {score:.2f})"
                         new_results.append((bbox, box_color, label))
 
                     cached_results = new_results
@@ -991,11 +1018,12 @@ def run_cctv_recognition(
                 for face in faces:
                     bx1, by1, bx2, by2 = [int(v) for v in face.bbox]
                     bbox = (bx1, by1, bx2, by2)
+                    is_masked = getattr(face, "is_masked", False)
                     is_ok, reason = check_face_quality(display_frame, face)
 
                     if not is_ok:
                         quality_tags[bbox] = reason
-                        raw_detections.append((bbox, "Unknown Person", 0.0, False))
+                        raw_detections.append((bbox, "Unknown Person", 0.0, False, is_masked))
                         continue
 
                     emb = face.normed_embedding
@@ -1004,30 +1032,42 @@ def run_cctv_recognition(
                         emb = (face.embedding / norm).astype(np.float32) if norm > 0 else None
 
                     if emb is not None:
-                        ident, score, is_amb = engine.match_face_detailed(emb, registry)
-                        raw_detections.append((bbox, ident, score, is_amb))
+                        ident, score, is_amb = engine.match_face_detailed(emb, registry, is_masked=is_masked)
+                        raw_detections.append((bbox, ident, score, is_amb, is_masked))
                     else:
-                        raw_detections.append((bbox, "Unknown Person", 0.0, False))
+                        unknown_id = "Unknown Person" if is_masked else "Unknown Person"
+                        raw_detections.append((bbox, unknown_id, 0.0, False, is_masked))
 
                 tracked = tracker.update(raw_detections)
                 new_results = []
 
-                for bbox, stab_id, score, is_confirmed, is_new_event in tracked:
+                for item in tracked:
+                    bbox, stab_id, score, is_confirmed, is_new_event = item[:5]
+                    is_masked = bool(item[5]) if len(item) >= 6 else False
+
                     if is_new_event:
-                        print(f"[FaceMatch Event] Recognized: {stab_id} (Confidence: {score:.2f})")
+                        mask_badge = "" if is_masked else ""
+                        print(f"[FaceMatch Event] Recognized: {stab_id}{mask_badge} (Confidence: {score:.2f})")
 
                     if bbox in quality_tags:
                         box_color = (0, 165, 255)  # Orange
                         label = f"Low Quality ({quality_tags[bbox]})"
                     elif is_confirmed:
-                        box_color = (0, 255, 0)    # Green
-                        label = f"{stab_id} (Sim: {score:.2f})"
+                        if is_masked:
+                            box_color = (255, 200, 0)  # Cyan/Teal
+                            label = f"{stab_id} (Sim: {score:.2f})"
+                        else:
+                            box_color = (0, 255, 0)    # Green
+                            label = f"{stab_id} (Sim: {score:.2f})"
                     elif stab_id.startswith("Verifying"):
                         box_color = (0, 255, 255)  # Yellow
                         label = f"{stab_id} ({score:.2f})"
                     else:
                         box_color = (0, 0, 255)    # Red
-                        label = f"Unknown Person (Sim: {score:.2f})"
+                        if is_masked:
+                            label = f"Unknown Person (Sim: {score:.2f})"
+                        else:
+                            label = f"Unknown Person (Sim: {score:.2f})"
 
                     new_results.append((bbox, box_color, label))
 

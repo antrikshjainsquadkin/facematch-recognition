@@ -58,6 +58,7 @@ class TrackState:
     confirmed_identity: Optional[str] = None
     event_emitted: bool = False
     last_event_time: float = 0.0
+    last_is_masked: bool = False
 
 
 class TemporalRecognitionTracker:
@@ -146,13 +147,21 @@ class TemporalRecognitionTracker:
                 iou_matrix[:, t_idx] = -1.0
 
         # 3. Process each detection with assigned or new track
+        has_mask_info = any(len(d) >= 5 for d in detections)
         results = []
-        for d_idx, (bbox, raw_id, score, is_ambiguous) in enumerate(detections):
+        for d_idx, d in enumerate(detections):
+            bbox = d[0]
+            raw_id = d[1]
+            score = d[2]
+            is_ambiguous = d[3]
+            is_masked = bool(d[4]) if len(d) >= 5 else False
+
             if d_idx in assigned_track_for_det:
                 tid = assigned_track_for_det[d_idx]
                 trk = self._tracks[tid]
                 trk.bbox = bbox
                 trk.last_seen_time = now
+                trk.last_is_masked = is_masked
             else:
                 tid = self._next_track_id
                 self._next_track_id += 1
@@ -160,6 +169,7 @@ class TemporalRecognitionTracker:
                     track_id=tid,
                     bbox=bbox,
                     last_seen_time=now,
+                    last_is_masked=is_masked,
                 )
                 self._tracks[tid] = trk
 
@@ -183,7 +193,7 @@ class TemporalRecognitionTracker:
             known_candidates = [
                 (ident, count, id_score_sums[ident] / count)
                 for ident, count in id_counts.items()
-                if ident != "Unknown Person"
+                if not ident.startswith("Unknown Person")
             ]
             known_candidates.sort(key=lambda x: -x[1])
 
@@ -214,7 +224,10 @@ class TemporalRecognitionTracker:
             else:
                 trk.confirmed_identity = None
 
-            results.append((bbox, final_identity, final_score, is_confirmed, is_new_event))
+            if has_mask_info:
+                results.append((bbox, final_identity, final_score, is_confirmed, is_new_event, is_masked))
+            else:
+                results.append((bbox, final_identity, final_score, is_confirmed, is_new_event))
 
         return results
 

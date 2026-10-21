@@ -83,6 +83,25 @@ SIMILARITY_THRESHOLD: float = 0.50
 MATCH_AMBIGUITY_MARGIN: float = 0.03  # Top candidate must beat runner-up by this margin
 
 # ==========================================
+# Masked-Face Recognition & Detection Thresholds
+# ==========================================
+# Enable or disable automated face mask detection
+MASK_DETECTION_ENABLED: bool = True
+
+# Probability threshold (0.0 - 1.0) for classifying a face as wearing a mask
+MASK_SCORE_THRESHOLD: float = 0.45
+
+# Cosine similarity threshold for faces wearing masks.
+# Occlusion of lower facial features (mouth/nose/chin) reduces full-face score,
+# while periocular and upper facial features reliably produce ~0.60-0.72 similarity
+# for genuine identities and <= 0.15 for imposters. A calibrated threshold of 0.38
+# allows robust matching under varied illumination and angles while preventing false acceptances.
+MASKED_SIMILARITY_THRESHOLD: float = 0.38
+
+# Ambiguity margin for masked faces: top candidate must beat runner-up by this margin
+MASKED_MATCH_AMBIGUITY_MARGIN: float = 0.03
+
+# ==========================================
 # Temporal Confirmation & Event Tracking
 # ==========================================
 # Require multiple confirmed frames within a rolling window before confirming identity

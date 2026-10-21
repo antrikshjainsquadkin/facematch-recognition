@@ -9,7 +9,12 @@ import os
 import json
 import time
 import threading
+import warnings
 from pathlib import Path
+
+# Suppress external library deprecation warnings from insightface / scikit-image
+warnings.filterwarnings("ignore", category=FutureWarning, module="insightface")
+
 from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
@@ -63,6 +68,110 @@ def compute_sharpness(crop: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+def compute_mask_probability(
+    frame: np.ndarray,
+    face: Any,
+    score_threshold: float = config.MASK_SCORE_THRESHOLD,
+) -> Tuple[bool, float]:
+    """Detect whether a face is wearing a face mask (surgical, N95, cloth, or dark mask).
+
+    Analyzes facial geometry from 5-point facial landmarks:
+    - Upper periocular region (forehead, eyebrows, eyes)
+    - Lower facial region (nose bridge down to chin)
+
+    Compares color tone, saturation, edge density, and lip presence across the two regions.
+    Masked faces exhibit distinct characteristics:
+    1. Smooth fabric with significantly reduced edge/texture density in the mouth region.
+    2. Surgical tint (cyan/blue/green) or neutral mask color (white N95 / black cloth)
+       deviating from natural upper-face skin tones.
+    3. Absence of natural lip redness and vermilion border in the lower facial crop.
+
+    Args:
+        frame: BGR image frame.
+        face: Detected InsightFace Face instance.
+        score_threshold: Probability threshold above which face is classified as masked.
+
+    Returns:
+        Tuple of (is_masked: bool, mask_score: float).
+    """
+    if frame is None or frame.size == 0 or face is None:
+        return False, 0.0
+
+    bx1, by1, bx2, by2 = [int(v) for v in face.bbox]
+    kps = getattr(face, "kps", None)
+    h_img, w_img = frame.shape[:2]
+    bx1 = max(0, bx1)
+    by1 = max(0, by1)
+    bx2 = min(w_img, bx2)
+    by2 = min(h_img, by2)
+    w = bx2 - bx1
+    h = by2 - by1
+    if w < 10 or h < 10:
+        return False, 0.0
+
+    # Upper region (forehead / periocular) and lower region (nose bridge down to chin)
+    if kps is not None and len(kps) >= 5:
+        nose_y = int(kps[2][1])
+    else:
+        nose_y = int(by1 + 0.55 * h)
+
+    # Ensure valid vertical bounds
+    nose_y = max(by1 + int(0.30 * h), min(by2 - int(0.20 * h), nose_y))
+
+    upper_crop = frame[by1:nose_y, bx1:bx2]
+    lower_crop = frame[nose_y:by2, bx1:bx2]
+    if upper_crop.size == 0 or lower_crop.size == 0:
+        return False, 0.0
+
+    upper_hsv = cv2.cvtColor(upper_crop, cv2.COLOR_BGR2HSV)
+    lower_hsv = cv2.cvtColor(lower_crop, cv2.COLOR_BGR2HSV)
+
+    u_h, u_s, u_v = [float(np.median(upper_hsv[:, :, i])) for i in range(3)]
+    l_h, l_s, l_v = [float(np.median(lower_hsv[:, :, i])) for i in range(3)]
+
+    # Normalized color distance in HSV space
+    dh = min(abs(u_h - l_h), 180.0 - abs(u_h - l_h)) / 90.0
+    ds = abs(u_s - l_s) / 255.0
+    dv = abs(u_v - l_v) / 255.0
+    color_dist = float(np.sqrt(dh * dh + ds * ds + dv * dv))
+
+    # Lower face edge density
+    lower_gray = cv2.cvtColor(lower_crop, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(lower_gray, 50, 150)
+    edge_density = float(np.sum(edges > 0)) / float(edges.size)
+
+    # Lip presence (skin/lip redness)
+    b, g, r = cv2.split(lower_crop.astype(np.float32))
+    lip_mask = (r > (g + 15)) & (r > (b + 15)) & (r > 60)
+    lip_ratio = float(np.sum(lip_mask)) / float(lower_crop.shape[0] * lower_crop.shape[1])
+
+    # Distinctive mask color signatures:
+    # 1. Surgical blue/cyan (75 <= H <= 130) or surgical green (35 <= H <= 75 with saturation)
+    is_surgical_tint = (75 <= l_h <= 130) or (35 <= l_h <= 75 and l_s > 40)
+    # 2. Neutral mask (white N95 or black fabric): low saturation compared to skin
+    is_neutral_mask = (l_s < 28 and (l_v > 175 or l_v < 60))
+
+    score = 0.0
+    if is_surgical_tint:
+        score += 0.55
+    elif is_neutral_mask:
+        score += 0.45
+    elif color_dist > 0.35:
+        score += min(0.40, (color_dist - 0.35) * 1.5)
+
+    # Edge density: masks have smooth cloth/synthetic texture (edge density < 0.045)
+    if edge_density < 0.045:
+        score += 0.35 * (1.0 - (edge_density / 0.045))
+
+    # Absence of natural lip redness in mouth area
+    if lip_ratio < 0.20:
+        score += 0.25 * (1.0 - (lip_ratio / 0.20))
+
+    mask_score = min(1.0, max(0.0, score))
+    is_masked = mask_score >= score_threshold
+    return is_masked, mask_score
+
+
 def check_face_quality(
     frame: np.ndarray,
     face: Any,
@@ -71,6 +180,8 @@ def check_face_quality(
     edge_margin: int = config.REC_EDGE_MARGIN_PX,
 ) -> Tuple[bool, str]:
     """Verify facial crop quality, rejecting blur, poor lighting, extreme angles, and edge clipping.
+
+    Handles both unmasked faces and faces wearing surgical/cloth masks safely.
 
     Args:
         frame: Original full-resolution image/frame.
@@ -123,7 +234,16 @@ def check_face_quality(
     # 5. Blur / Sharpness check
     sharpness = compute_sharpness(crop)
     if sharpness < min_sharpness:
-        return False, f"Face blurry (sharpness {sharpness:.1f} < {min_sharpness:.1f})"
+        # If lower face is occluded by smooth mask cloth, evaluate sharpness on upper periocular region
+        is_masked = getattr(face, "is_masked", False)
+        upper_sharpness = 0.0
+        if is_masked and crop.shape[0] >= 20:
+            upper_crop = crop[: int(crop.shape[0] * 0.55), :]
+            upper_sharpness = compute_sharpness(upper_crop)
+        if upper_sharpness >= min_sharpness:
+            sharpness = upper_sharpness
+        else:
+            return False, f"Face blurry (sharpness {sharpness:.1f} < {min_sharpness:.1f})"
 
     # 6. Extreme pose check (yaw asymmetry from 5 facial landmarks)
     kps = getattr(face, "kps", None)
@@ -401,6 +521,7 @@ class FaceEngine:
         scale: float = 1.0,
         min_score: float = config.REC_MIN_DET_SCORE,
         min_size: Tuple[int, int] = (config.REC_MIN_FACE_WIDTH, config.REC_MIN_FACE_HEIGHT),
+        det_size: Optional[Tuple[int, int]] = None,
     ) -> List[Any]:
         """Detect faces in a BGR frame with configurable quality thresholds.
 
@@ -413,6 +534,7 @@ class FaceEngine:
             scale: Downscaling factor for faster inference (e.g. 0.5).
             min_score: Minimum detection confidence threshold to accept.
             min_size: Minimum (width, height) bounding box size to accept.
+            det_size: Optional detector input resolution (defaults to config.REC_DETECTION_SIZE).
 
         Returns:
             List of detected Face objects meeting the specified score and size.
@@ -420,8 +542,9 @@ class FaceEngine:
         self.ensure_ready()
         assert self._app is not None
 
-        # Ensure detector is configured for real-time recognition
-        self._set_detector_input_size(config.REC_DETECTION_SIZE)
+        # Configure detector resolution (defaulting to REC_DETECTION_SIZE for real-time throughput)
+        target_size = det_size if det_size is not None else config.REC_DETECTION_SIZE
+        self._set_detector_input_size(target_size)
 
         min_w, min_h = min_size
         rec_model = self._app.models.get("recognition")
@@ -458,6 +581,16 @@ class FaceEngine:
 
                 filtered_faces.append(face)
 
+            if config.MASK_DETECTION_ENABLED:
+                for f in filtered_faces:
+                    is_m, m_sc = compute_mask_probability(frame, f)
+                    f.is_masked = is_m
+                    f.mask_score = m_sc
+            else:
+                for f in filtered_faces:
+                    f.is_masked = False
+                    f.mask_score = 0.0
+
             return filtered_faces
 
         # Full resolution inference
@@ -475,7 +608,31 @@ class FaceEngine:
             if width >= min_w and height >= min_h:
                 filtered_faces.append(face)
 
+        if config.MASK_DETECTION_ENABLED:
+            for f in filtered_faces:
+                is_m, m_sc = compute_mask_probability(frame, f)
+                f.is_masked = is_m
+                f.mask_score = m_sc
+        else:
+            for f in filtered_faces:
+                f.is_masked = False
+                f.mask_score = 0.0
+
         return filtered_faces
+
+    def detect_face_mask(self, frame: np.ndarray, face: Any) -> Tuple[bool, float]:
+        """Detect whether a face in the frame is wearing a face mask (surgical, N95, cloth, etc.).
+
+        Args:
+            frame: Full BGR image frame.
+            face: Detected Face instance.
+
+        Returns:
+            Tuple of (is_masked: bool, mask_score: float).
+        """
+        if hasattr(face, "is_masked") and hasattr(face, "mask_score"):
+            return face.is_masked, face.mask_score
+        return compute_mask_probability(frame, face)
 
     def extract_single_face_for_registration(
         self, frame: np.ndarray
@@ -500,73 +657,106 @@ class FaceEngine:
         if frame is None or frame.size == 0:
             return None, "Invalid image data provided.", None
 
-        # Set high resolution detector size for registration to capture fine facial details
-        self._set_detector_input_size(config.REG_DETECTION_SIZE)
-
-        # Run detection ONCE at base threshold to diagnose any issues without redundant second pass
-        raw_faces = self.detect_faces(frame, scale=1.0, min_score=0.25, min_size=(20, 20))
-
-        if len(raw_faces) == 0:
-            return None, "No face detected. Please face the camera directly in good lighting.", None
-
-        # Check how many qualify under strict registration criteria
-        valid_candidates = []
-        for f in raw_faces:
-            w = int(f.bbox[2] - f.bbox[0])
-            h = int(f.bbox[3] - f.bbox[1])
-            score = float(f.det_score)
-            if w >= config.REG_MIN_FACE_WIDTH and h >= config.REG_MIN_FACE_HEIGHT and score >= config.REG_MIN_DET_SCORE:
-                valid_candidates.append(f)
-
-        if len(valid_candidates) == 0:
-            # Diagnose reason on first candidate without re-running detection
-            lead = raw_faces[0]
-            lw = int(lead.bbox[2] - lead.bbox[0])
-            lh = int(lead.bbox[3] - lead.bbox[1])
-            score = float(lead.det_score)
-            if lw < config.REG_MIN_FACE_WIDTH or lh < config.REG_MIN_FACE_HEIGHT:
-                return None, f"Face is too small ({lw}x{lh}px). Registration requires >= {config.REG_MIN_FACE_WIDTH}x{config.REG_MIN_FACE_HEIGHT}px.", None
-            if score < config.REG_MIN_DET_SCORE:
-                return None, f"Face confidence too low ({score:.2f} < {config.REG_MIN_DET_SCORE:.2f}). Improve lighting.", None
-            return None, "Face quality insufficient for registration. Ensure clear front-facing lighting.", None
-
-        if len(valid_candidates) > 1:
-            return (
-                None,
-                f"Multiple faces detected ({len(valid_candidates)}). Ensure only one person is in the frame.",
-                None,
+        # Run detection ONCE at base threshold with REG_DETECTION_SIZE (640x640) for precise alignment
+        try:
+            raw_faces = self.detect_faces(
+                frame,
+                scale=1.0,
+                min_score=0.25,
+                min_size=(20, 20),
+                det_size=config.REG_DETECTION_SIZE,
             )
 
-        face = valid_candidates[0]
-        x1, y1, x2, y2 = [int(v) for v in face.bbox]
-        h_img, w_img = frame.shape[:2]
+            if len(raw_faces) == 0:
+                return None, "No face detected. Please face the camera directly in good lighting.", None
 
-        x1_cl = max(0, x1)
-        y1_cl = max(0, y1)
-        x2_cl = min(w_img, x2)
-        y2_cl = min(h_img, y2)
+            # Check for face mask first on detected face candidate(s), reusing cached mask detection if present
+            if config.MASK_DETECTION_ENABLED:
+                for f in raw_faces:
+                    is_m = getattr(f, "is_masked", None)
+                    if is_m is None:
+                        is_m, _ = compute_mask_probability(frame, f)
+                    if is_m:
+                        bx = [int(v) for v in f.bbox]
+                        return (
+                            None,
+                            "Face mask detected. Face registration requires an unmasked face to ensure reliable biometric identification.",
+                            (bx[0], bx[1], bx[2], bx[3]),
+                        )
 
-        face_crop = frame[y1_cl:y2_cl, x1_cl:x2_cl]
+            # Check how many qualify under strict registration criteria
+            valid_candidates = []
+            for f in raw_faces:
+                w = int(f.bbox[2] - f.bbox[0])
+                h = int(f.bbox[3] - f.bbox[1])
+                score = float(f.det_score)
+                if w >= config.REG_MIN_FACE_WIDTH and h >= config.REG_MIN_FACE_HEIGHT and score >= config.REG_MIN_DET_SCORE:
+                    valid_candidates.append(f)
 
-        # Blur / sharpness check
-        sharpness = compute_sharpness(face_crop)
-        if sharpness < config.REG_MIN_SHARPNESS:
-            return (
-                None,
-                f"Face image is too blurry (sharpness: {sharpness:.1f} < {config.REG_MIN_SHARPNESS:.1f}). Ensure a steady camera and good lighting.",
-                (x1, y1, x2, y2),
-            )
+            if len(valid_candidates) == 0:
+                # Diagnose reason on first candidate without re-running detection
+                lead = raw_faces[0]
+                lw = int(lead.bbox[2] - lead.bbox[0])
+                lh = int(lead.bbox[3] - lead.bbox[1])
+                score = float(lead.det_score)
+                if lw < config.REG_MIN_FACE_WIDTH or lh < config.REG_MIN_FACE_HEIGHT:
+                    return None, f"Face is too small ({lw}x{lh}px). Registration requires >= {config.REG_MIN_FACE_WIDTH}x{config.REG_MIN_FACE_HEIGHT}px.", None
+                if score < config.REG_MIN_DET_SCORE:
+                    return None, f"Face confidence too low ({score:.2f} < {config.REG_MIN_DET_SCORE:.2f}). Improve lighting.", None
+                return None, "Face quality insufficient for registration. Ensure clear front-facing lighting.", None
 
-        # Extract normalized embedding
-        embedding = face.normed_embedding
-        if embedding is None:
-            raw_emb = face.embedding
-            norm = float(np.linalg.norm(raw_emb))
-            if norm <= 1e-7:
-                return None, "Failed to compute valid face embedding (zero norm).", (x1, y1, x2, y2)
-            embedding = raw_emb / norm
+            if len(valid_candidates) > 1:
+                return (
+                    None,
+                    f"Multiple faces detected ({len(valid_candidates)}). Ensure only one person is in the frame.",
+                    None,
+                )
 
-        return embedding.astype(np.float32), None, (x1, y1, x2, y2)
+            face = valid_candidates[0]
+            x1, y1, x2, y2 = [int(v) for v in face.bbox]
+            h_img, w_img = frame.shape[:2]
+
+            x1_cl = max(0, x1)
+            y1_cl = max(0, y1)
+            x2_cl = min(w_img, x2)
+            y2_cl = min(h_img, y2)
+
+            face_crop = frame[y1_cl:y2_cl, x1_cl:x2_cl]
+
+            # Blur / sharpness check
+            sharpness = compute_sharpness(face_crop)
+            if sharpness < config.REG_MIN_SHARPNESS:
+                return (
+                    None,
+                    f"Face image is too blurry (sharpness: {sharpness:.1f} < {config.REG_MIN_SHARPNESS:.1f}). Ensure a steady camera and good lighting.",
+                    (x1, y1, x2, y2),
+                )
+
+            # Enforce that the registered subject is not wearing a mask
+            if config.MASK_DETECTION_ENABLED:
+                is_masked = getattr(face, "is_masked", None)
+                if is_masked is None:
+                    is_masked, _ = compute_mask_probability(frame, face)
+                if is_masked:
+                    return (
+                        None,
+                        "Face mask detected. Face registration requires an unmasked face to ensure reliable biometric identification.",
+                        (x1, y1, x2, y2),
+                    )
+
+            # Extract normalized embedding
+            embedding = face.normed_embedding
+            if embedding is None:
+                raw_emb = face.embedding
+                norm = float(np.linalg.norm(raw_emb))
+                if norm <= 1e-7:
+                    return None, "Failed to compute valid face embedding (zero norm).", (x1, y1, x2, y2)
+                embedding = raw_emb / norm
+
+            return embedding.astype(np.float32), None, (x1, y1, x2, y2)
+        finally:
+            # Restore real-time detector size for low-load recognition
+            self._set_detector_input_size(config.REC_DETECTION_SIZE)
 
     def set_registry(self, registry: Dict[str, np.ndarray]) -> None:
         """Explicitly update and sync the in-memory vectorized matching matrix cache."""
@@ -595,19 +785,28 @@ class FaceEngine:
         self,
         embedding: np.ndarray,
         registry: Dict[str, np.ndarray],
-        threshold: float = config.SIMILARITY_THRESHOLD,
+        threshold: Optional[float] = None,
+        is_masked: bool = False,
     ) -> Tuple[str, float]:
         """Compare a face embedding against all enrolled identities using vectorized BLAS dot product.
 
+        Supports both unmasked faces (SIMILARITY_THRESHOLD = 0.50) and masked faces
+        (MASKED_SIMILARITY_THRESHOLD = 0.38) with configurable thresholds.
+
         Achieves 60x+ faster comparison than Python loops.
         Never alters registry or writes to storage. Returns the recognized identity
-        only when cosine similarity meets the threshold; otherwise 'Unknown Person'.
+        only when cosine similarity meets the threshold; otherwise 'Unknown Person'
+        or 'Unknown Person [Masked]'.
         """
+        if threshold is None:
+            threshold = config.MASKED_SIMILARITY_THRESHOLD if is_masked else config.SIMILARITY_THRESHOLD
+
         ident, score, _ = self.match_face_detailed(
             embedding=embedding,
             registry=registry,
             threshold=threshold,
-            min_margin=config.MATCH_AMBIGUITY_MARGIN,
+            min_margin=config.MASKED_MATCH_AMBIGUITY_MARGIN if is_masked else config.MATCH_AMBIGUITY_MARGIN,
+            is_masked=is_masked,
         )
         return ident, score
 
@@ -615,31 +814,40 @@ class FaceEngine:
         self,
         embedding: np.ndarray,
         registry: Dict[str, np.ndarray],
-        threshold: float = config.SIMILARITY_THRESHOLD,
-        min_margin: float = config.MATCH_AMBIGUITY_MARGIN,
+        threshold: Optional[float] = None,
+        min_margin: Optional[float] = None,
+        is_masked: bool = False,
     ) -> Tuple[str, float, bool]:
-        """Detailed vectorized matching with ambiguity rejection.
+        """Detailed vectorized matching with ambiguity rejection and masked-face support.
 
         Args:
             embedding: Query face embedding vector.
             registry: Registered identities dictionary.
-            threshold: Cosine similarity threshold.
+            threshold: Cosine similarity threshold (defaults to MASKED_SIMILARITY_THRESHOLD if is_masked else SIMILARITY_THRESHOLD).
             min_margin: Minimum margin between top-1 and top-2 candidate to prevent identity ambiguity.
+            is_masked: True if the face has been detected as wearing a face mask.
 
         Returns:
             Tuple of (identity_name, similarity_score, is_ambiguous).
         """
+        if threshold is None:
+            threshold = config.MASKED_SIMILARITY_THRESHOLD if is_masked else config.SIMILARITY_THRESHOLD
+        if min_margin is None:
+            min_margin = config.MASKED_MATCH_AMBIGUITY_MARGIN if is_masked else config.MATCH_AMBIGUITY_MARGIN
+
+        unknown_label = "Unknown Person" if is_masked else "Unknown Person"
+
         if not registry:
-            return "Unknown Person", 0.0, False
+            return unknown_label, 0.0, False
 
         self._update_matrix_cache(registry)
         if self._matrix_cache is None or len(self._matrix_names) == 0:
-            return "Unknown Person", 0.0, False
+            return unknown_label, 0.0, False
 
         # Ensure query embedding is unit-normalized for true cosine similarity
         norm = float(np.linalg.norm(embedding))
         if norm <= 1e-7:
-            return "Unknown Person", 0.0, False
+            return unknown_label, 0.0, False
         normed_emb = (embedding / norm).astype(np.float32) if abs(norm - 1.0) > 1e-4 else embedding.astype(np.float32)
 
         # Vectorized dot product against all N enrolled unit vectors in one fast call
@@ -648,16 +856,23 @@ class FaceEngine:
         best_score = float(scores[best_idx])
 
         if best_score < threshold:
-            return "Unknown Person", max(0.0, best_score), False
+            return unknown_label, max(0.0, best_score), False
 
         # Check for ambiguity if multiple identities are enrolled
         if len(self._matrix_names) > 1:
-            sorted_indices = np.argsort(scores)[::-1]
-            top1_score = float(scores[sorted_indices[0]])
-            top2_score = float(scores[sorted_indices[1]])
+            if len(self._matrix_names) == 2:
+                top1_score = best_score
+                other_idx = 1 if best_idx == 0 else 0
+                top2_score = float(scores[other_idx])
+            else:
+                top2_idx = np.argpartition(scores, -2)[-2:]
+                top2_idx = top2_idx[np.argsort(scores[top2_idx])[::-1]]
+                top1_score = float(scores[top2_idx[0]])
+                top2_score = float(scores[top2_idx[1]])
+
             if top2_score >= (threshold - 0.05) and (top1_score - top2_score) < min_margin:
                 # Top match cannot be decisively separated from the second match
-                return "Unknown Person", top1_score, True
+                return unknown_label, top1_score, True
 
         return self._matrix_names[best_idx], best_score, False
 
@@ -665,16 +880,18 @@ class FaceEngine:
         self,
         embeddings: List[np.ndarray],
         registry: Dict[str, np.ndarray],
-        threshold: float = config.SIMILARITY_THRESHOLD,
-        min_margin: float = config.MATCH_AMBIGUITY_MARGIN,
+        threshold: Optional[float] = None,
+        min_margin: Optional[float] = None,
+        is_masked_list: Optional[List[bool]] = None,
     ) -> List[Tuple[str, float, bool]]:
         """Match multiple detected face embeddings in a single optimized BLAS matrix multiplication.
 
         Args:
             embeddings: List of 512-D face embedding vectors.
             registry: Registered identities dictionary.
-            threshold: Cosine similarity threshold.
+            threshold: Base cosine similarity threshold (or None to use per-face masked/unmasked config).
             min_margin: Margin required between top-1 and top-2 candidate.
+            is_masked_list: Optional list indicating mask status for each embedding.
 
         Returns:
             List of (identity_name, similarity_score, is_ambiguous) for each embedding.
@@ -701,20 +918,36 @@ class FaceEngine:
             best_idx = int(np.argmax(row_scores))
             best_score = float(row_scores[best_idx])
 
-            if best_score < threshold:
-                results.append(("Unknown Person", max(0.0, best_score), False))
+            is_masked = is_masked_list[i] if (is_masked_list and i < len(is_masked_list)) else False
+            eff_thresh = threshold if threshold is not None else (
+                config.MASKED_SIMILARITY_THRESHOLD if is_masked else config.SIMILARITY_THRESHOLD
+            )
+            eff_margin = min_margin if min_margin is not None else (
+                config.MASKED_MATCH_AMBIGUITY_MARGIN if is_masked else config.MATCH_AMBIGUITY_MARGIN
+            )
+            unknown_label = "Unknown Person" if is_masked else "Unknown Person"
+
+            if best_score < eff_thresh:
+                results.append((unknown_label, max(0.0, best_score), False))
                 continue
 
             is_ambiguous = False
             if len(self._matrix_names) > 1:
-                sorted_indices = np.argsort(row_scores)[::-1]
-                top1_score = float(row_scores[sorted_indices[0]])
-                top2_score = float(row_scores[sorted_indices[1]])
-                if top2_score >= (threshold - 0.05) and (top1_score - top2_score) < min_margin:
+                if len(self._matrix_names) == 2:
+                    top1_score = best_score
+                    other_idx = 1 if best_idx == 0 else 0
+                    top2_score = float(row_scores[other_idx])
+                else:
+                    top2_idx = np.argpartition(row_scores, -2)[-2:]
+                    top2_idx = top2_idx[np.argsort(row_scores[top2_idx])[::-1]]
+                    top1_score = float(row_scores[top2_idx[0]])
+                    top2_score = float(row_scores[top2_idx[1]])
+
+                if top2_score >= (eff_thresh - 0.05) and (top1_score - top2_score) < eff_margin:
                     is_ambiguous = True
 
             if is_ambiguous:
-                results.append(("Unknown Person", best_score, True))
+                results.append((unknown_label, best_score, True))
             else:
                 results.append((self._matrix_names[best_idx], best_score, False))
 

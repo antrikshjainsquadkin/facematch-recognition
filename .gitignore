@@ -9,6 +9,7 @@ venv/
 ENV/
 env/
 sandbox/
+tests/
 
 # Development / Cleanup Backups
 _cleanup_backup/

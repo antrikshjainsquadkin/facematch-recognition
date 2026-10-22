@@ -1,0 +1,9 @@
+{
+  "username": "",
+  "password": "",
+  "ip_address": "",
+  "port": "",
+  "stream_path": "",
+  "scheme": "http",
+  "video_backend": "auto"
+}

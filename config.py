@@ -29,8 +29,8 @@ CTX_ID: int = -1
 # Registration: 640x640 provides higher precision for face landmarks and alignment
 REG_DETECTION_SIZE: tuple[int, int] = (640, 640)
 
-# Recognition: 320x320 provides ~2x faster detection throughput (25+ FPS) on CPU
-REC_DETECTION_SIZE: tuple[int, int] = (320, 320)
+# Recognition: 640x640 preserves essential fine facial details for distant faces
+REC_DETECTION_SIZE: tuple[int, int] = (640, 640)
 
 # Default detection size for backwards compatibility
 DETECTION_SIZE: tuple[int, int] = REC_DETECTION_SIZE
@@ -43,8 +43,8 @@ DETECTION_SIZE: tuple[int, int] = REC_DETECTION_SIZE
 _TOTAL_CORES = os.cpu_count() or 2
 ONNX_NUM_THREADS: int = 2 if _TOTAL_CORES >= 2 else 1
 
-# Live webcam preview downscaling factor (0.5 for fast preview, 1.0 for original resolution)
-INFERENCE_SCALE: float = 0.5
+# Live webcam preview downscaling factor (1.0 for full-resolution distant face preservation)
+INFERENCE_SCALE: float = 1.0
 
 # Run deep learning inference once every N frames to keep CPU usage low
 PROCESS_EVERY_N_FRAMES: int = 3
@@ -57,21 +57,36 @@ REG_MIN_FACE_WIDTH: int = 80        # Minimum face box width in pixels
 REG_MIN_FACE_HEIGHT: int = 80       # Minimum face box height in pixels
 REG_MIN_DET_SCORE: float = 0.65     # Strict detector confidence (0.0 to 1.0)
 REG_MIN_SHARPNESS: float = 40.0     # Minimum Laplacian variance (blur rejection)
+REG_MAX_YAW_RATIO: float = 0.40     # Maximum head pose asymmetry for frontal registration (reject turned heads)
+REG_MAX_ROLL_TILT: float = 0.40     # Maximum eye vertical tilt ratio (reject severe sideways head tilt)
+REG_MIN_BRIGHTNESS: float = 32.0    # Minimum average pixel luminance (darkness rejection)
+REG_MAX_BRIGHTNESS: float = 228.0   # Maximum average pixel luminance (overexposure rejection)
+REG_MIN_CONTRAST: float = 14.0      # Minimum grayscale std-dev (flat/washed-out rejection)
+REG_EDGE_MARGIN_PX: int = 8         # Border margin in pixels; faces touching edge are rejected
 
 # ==========================================
 # Recognition Quality Thresholds (Evidence-Based Accuracy)
 # Enforces reliable detection, rejecting blur, poor lighting, and edge crops
 # ==========================================
-REC_MIN_FACE_WIDTH: int = 36        # Minimum face box width in pixels (reject tiny artifacts)
-REC_MIN_FACE_HEIGHT: int = 36       # Minimum face box height in pixels
-REC_MIN_DET_SCORE: float = 0.40     # Detector confidence threshold
+REC_MIN_FACE_WIDTH: int = 24        # Minimum face box width in pixels (calibrated for distant face detection down to ~3.5m)
+REC_MIN_FACE_HEIGHT: int = 24       # Minimum face box height in pixels
+REC_MIN_DET_SCORE: float = 0.30     # Detector confidence threshold calibrated for distant and occluded faces
 REC_INFERENCE_SCALE: float = 1.0    # Full resolution inference for recorded video analysis
 REC_MIN_SHARPNESS: float = 14.0     # Minimum Laplacian variance for recognition (blur rejection)
-REC_MIN_BRIGHTNESS: float = 32.0    # Minimum average pixel luminance (darkness rejection)
+REC_MIN_BRIGHTNESS: float = 32.0    # Minimum average pixel luminance (darkness rejection for normal lighting)
 REC_MAX_BRIGHTNESS: float = 228.0   # Maximum average pixel luminance (overexposure rejection)
-REC_MIN_CONTRAST: float = 14.0      # Minimum grayscale std-dev (flat region rejection)
+REC_MIN_CONTRAST: float = 14.0      # Minimum grayscale std-dev (flat region rejection for normal lighting)
 REC_EDGE_MARGIN_PX: int = 4         # Border margin in pixels; faces touching edge are rejected
 REC_MAX_YAW_RATIO: float = 0.75     # Extreme side-profile pose rejection from 5 facial landmarks
+
+# ==========================================
+# Dark RGB & Night-Vision / IR Settings
+# ==========================================
+ENHANCE_LOW_LIGHT_ENABLED: bool = True
+LOW_LIGHT_BRIGHTNESS_THRESHOLD: float = 40.0   # Trigger enhancement when average frame luminance < 40.0
+REC_MIN_BRIGHTNESS_LOW_LIGHT: float = 10.0     # Minimum average pixel luminance for low-light/night-vision
+REC_MIN_CONTRAST_LOW_LIGHT: float = 8.0        # Minimum grayscale contrast for low-light/night-vision
+
 
 # ==========================================
 # Face Identity Matching & Ambiguity Thresholds
@@ -93,10 +108,10 @@ MASK_SCORE_THRESHOLD: float = 0.45
 
 # Cosine similarity threshold for faces wearing masks.
 # Occlusion of lower facial features (mouth/nose/chin) reduces full-face score,
-# while periocular and upper facial features reliably produce ~0.60-0.72 similarity
-# for genuine identities and <= 0.15 for imposters. A calibrated threshold of 0.38
-# allows robust matching under varied illumination and angles while preventing false acceptances.
-MASKED_SIMILARITY_THRESHOLD: float = 0.38
+# while periocular and upper facial features produce ~0.50-0.72 at close range
+# and ~0.33-0.48 under distance and slight angles, with imposters consistently <= 0.16.
+# A calibrated threshold of 0.32 eliminates frame-to-frame dropouts while strictly rejecting imposters.
+MASKED_SIMILARITY_THRESHOLD: float = 0.32
 
 # Ambiguity margin for masked faces: top candidate must beat runner-up by this margin
 MASKED_MATCH_AMBIGUITY_MARGIN: float = 0.03

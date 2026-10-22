@@ -121,14 +121,15 @@ def register_face(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None:
                 print("[Error] Failed to read frame from webcam.")
                 break
 
-            display_frame = cv2.flip(frame, 1)
+            clean_frame = cv2.flip(frame, 1)
+            display_frame = clean_frame.copy()
             h, w = display_frame.shape[:2]
             frame_count += 1
 
             # Preview face alignment guide (uses tolerant detection to help user align)
             if frame_count % config.PROCESS_EVERY_N_FRAMES == 0 or not cached_face_boxes:
                 detected = engine.detect_faces(
-                    display_frame,
+                    clean_frame,
                     scale=config.INFERENCE_SCALE,
                     min_score=config.REC_MIN_DET_SCORE,
                     min_size=(config.REC_MIN_FACE_WIDTH, config.REC_MIN_FACE_HEIGHT),
@@ -183,7 +184,7 @@ def register_face(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None:
 
             if key == 32:  # SPACE to capture
                 # Extract face with strict quality checks (clear, large, sharp, single face)
-                emb, err, bbox = engine.extract_single_face_for_registration(display_frame)
+                emb, err, bbox = engine.extract_single_face_for_registration(clean_frame)
 
                 if err is not None:
                     status_message = f"Failed: {err}"
@@ -486,8 +487,7 @@ def recognize_faces(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None
                         ident, score, is_amb = engine.match_face_detailed(emb, registry, is_masked=is_masked)
                         raw_detections.append((bbox, ident, score, is_amb, is_masked))
                     else:
-                        unknown_id = "Unknown Person " if is_masked else "Unknown Person"
-                        raw_detections.append((bbox, unknown_id, 0.0, False, is_masked))
+                        raw_detections.append((bbox, "Unknown Person", 0.0, False, is_masked))
 
                 tracked_results = tracker.update(raw_detections)
                 new_results = []
@@ -497,8 +497,8 @@ def recognize_faces(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None
                     is_masked = bool(item[5]) if len(item) >= 6 else False
 
                     if is_new_event:
-                        mask_badge = " " if is_masked else ""
-                        print(f"[FaceMatch Event] Recognized: {stab_id} (Confidence: {score:.2f})")
+                        mask_note = " [Masked]" if is_masked else ""
+                        print(f"[FaceMatch Event] Recognized: {stab_id}{mask_note} (Confidence: {score:.2f})")
 
                     if bbox in quality_tags:
                         box_color = (0, 165, 255)  # Orange
@@ -515,10 +515,7 @@ def recognize_faces(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> None
                         label = f"{stab_id} ({score:.2f})"
                     else:
                         box_color = (0, 0, 255)    # Red
-                        if is_masked:
-                            label = f"Unknown Person  (Sim: {score:.2f})"
-                        else:
-                            label = f"Unknown Person (Sim: {score:.2f})"
+                        label = f"Unknown Person (Sim: {score:.2f})"
 
                     new_results.append((bbox, box_color, label))
 
@@ -653,8 +650,7 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
                             ident, score, is_amb = engine.match_face_detailed(emb, registry, is_masked=is_masked)
                             raw_detections.append((bbox, ident, score, is_amb, is_masked))
                         else:
-                            unknown_id = "Unknown Person" if is_masked else "Unknown Person"
-                            raw_detections.append((bbox, unknown_id, 0.0, False, is_masked))
+                            raw_detections.append((bbox, "Unknown Person", 0.0, False, is_masked))
 
                     tracked = tracker.update(raw_detections)
                     new_results = []
@@ -663,8 +659,7 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
                         is_masked = bool(item[5]) if len(item) >= 6 else False
 
                         if is_confirmed and not stab_id.startswith("Unknown Person"):
-                            match_key = f"{stab_id}" if is_masked else stab_id
-                            match_counts[match_key] = match_counts.get(match_key, 0) + 1
+                            match_counts[stab_id] = match_counts.get(stab_id, 0) + 1
                         elif not is_confirmed and not stab_id.startswith("Verifying"):
                             match_counts["Unknown Person"] = match_counts.get("Unknown Person", 0) + 1
 
@@ -683,10 +678,7 @@ def recognize_from_video_file(engine: FaceEngine, registry: Dict[str, np.ndarray
                             label = f"{stab_id} ({score:.2f})"
                         else:
                             box_color = (0, 0, 255)
-                            if is_masked:
-                                label = f"Unknown Person (Sim: {score:.2f})"
-                            else:
-                                label = f"Unknown Person (Sim: {score:.2f})"
+                            label = f"Unknown Person (Sim: {score:.2f})"
                         new_results.append((bbox, box_color, label))
 
                     cached_results = new_results
@@ -1035,8 +1027,7 @@ def run_cctv_recognition(
                         ident, score, is_amb = engine.match_face_detailed(emb, registry, is_masked=is_masked)
                         raw_detections.append((bbox, ident, score, is_amb, is_masked))
                     else:
-                        unknown_id = "Unknown Person" if is_masked else "Unknown Person"
-                        raw_detections.append((bbox, unknown_id, 0.0, False, is_masked))
+                        raw_detections.append((bbox, "Unknown Person", 0.0, False, is_masked))
 
                 tracked = tracker.update(raw_detections)
                 new_results = []
@@ -1046,8 +1037,8 @@ def run_cctv_recognition(
                     is_masked = bool(item[5]) if len(item) >= 6 else False
 
                     if is_new_event:
-                        mask_badge = "" if is_masked else ""
-                        print(f"[FaceMatch Event] Recognized: {stab_id}{mask_badge} (Confidence: {score:.2f})")
+                        mask_note = " [Masked]" if is_masked else ""
+                        print(f"[FaceMatch Event] Recognized: {stab_id}{mask_note} (Confidence: {score:.2f})")
 
                     if bbox in quality_tags:
                         box_color = (0, 165, 255)  # Orange
@@ -1064,10 +1055,7 @@ def run_cctv_recognition(
                         label = f"{stab_id} ({score:.2f})"
                     else:
                         box_color = (0, 0, 255)    # Red
-                        if is_masked:
-                            label = f"Unknown Person (Sim: {score:.2f})"
-                        else:
-                            label = f"Unknown Person (Sim: {score:.2f})"
+                        label = f"Unknown Person (Sim: {score:.2f})"
 
                     new_results.append((bbox, box_color, label))
 

@@ -49,6 +49,70 @@ except ImportError as exc:
 # Quality Verification Helpers
 # ============================================================================
 
+def enhance_low_light_frame(
+    frame: np.ndarray,
+    brightness_threshold: float = config.LOW_LIGHT_BRIGHTNESS_THRESHOLD,
+) -> Tuple[np.ndarray, bool]:
+    """Dynamically enhance underexposed RGB or monochrome IR frames using adaptive Gamma and CLAHE.
+
+    Bypasses enhancement for well-lit frames (mean brightness >= threshold) with zero latency overhead.
+    For underexposed frames, lifts deep shadows and improves local facial contrast without blowing highlights
+    or amplifying high-frequency noise.
+
+    Args:
+        frame: Input frame (BGR or single-channel grayscale).
+        brightness_threshold: Luminance below which enhancement is activated.
+
+    Returns:
+        Tuple of (processed_frame: np.ndarray, was_enhanced: bool).
+    """
+    if frame is None or frame.size == 0 or not config.ENHANCE_LOW_LIGHT_ENABLED:
+        return frame, False
+
+    # Ensure 3 channels for InsightFace SCRFD and ArcFace
+    if len(frame.shape) == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    elif frame.shape[2] == 1:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
+    # Fast luminance check on downscaled grayscale
+    h, w = frame.shape[:2]
+    small_gray = cv2.resize(frame, (min(w, 160), min(h, 120)), interpolation=cv2.INTER_NEAREST)
+    if len(small_gray.shape) == 3:
+        small_gray = cv2.cvtColor(small_gray, cv2.COLOR_BGR2GRAY)
+    mean_val = float(np.mean(small_gray))
+
+    if mean_val >= brightness_threshold:
+        return frame, False
+
+    # Check if frame is monochrome / IR
+    b, g, r = cv2.split(frame)
+    diff_bg = cv2.absdiff(b, g)
+    diff_gr = cv2.absdiff(g, r)
+    is_monochrome = float(np.mean(diff_bg)) < 4.0 and float(np.mean(diff_gr)) < 4.0
+
+    gamma = float(np.clip(np.log(45.0 / max(mean_val, 1.0)) / np.log(2.0), 1.2, 2.8))
+    inv_gamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], dtype=np.uint8)
+
+    if is_monochrome:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray_gamma = cv2.LUT(gray, table)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_enh = clahe.apply(gray_gamma)
+        enhanced = cv2.cvtColor(gray_enh, cv2.COLOR_GRAY2BGR)
+        return enhanced, True
+    else:
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b_ch = cv2.split(lab)
+        l_gamma = cv2.LUT(l, table)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l_enh = clahe.apply(l_gamma)
+        enhanced_lab = cv2.merge([l_enh, a, b_ch])
+        enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+        return enhanced, True
+
+
 def compute_sharpness(crop: np.ndarray) -> float:
     """Compute image sharpness metric using Laplacian variance.
 
@@ -75,16 +139,14 @@ def compute_mask_probability(
 ) -> Tuple[bool, float]:
     """Detect whether a face is wearing a face mask (surgical, N95, cloth, or dark mask).
 
+    Supports both full-color RGB frames and monochrome/near-infrared (IR) nighttime frames.
     Analyzes facial geometry from 5-point facial landmarks:
     - Upper periocular region (forehead, eyebrows, eyes)
     - Lower facial region (nose bridge down to chin)
 
     Compares color tone, saturation, edge density, and lip presence across the two regions.
-    Masked faces exhibit distinct characteristics:
-    1. Smooth fabric with significantly reduced edge/texture density in the mouth region.
-    2. Surgical tint (cyan/blue/green) or neutral mask color (white N95 / black cloth)
-       deviating from natural upper-face skin tones.
-    3. Absence of natural lip redness and vermilion border in the lower facial crop.
+    In monochrome/IR frames, evaluates smooth lower-face fabric texture and upper-to-lower
+    luminance contrast across the nose bridge rim.
 
     Args:
         frame: BGR image frame.
@@ -129,47 +191,112 @@ def compute_mask_probability(
     u_h, u_s, u_v = [float(np.median(upper_hsv[:, :, i])) for i in range(3)]
     l_h, l_s, l_v = [float(np.median(lower_hsv[:, :, i])) for i in range(3)]
 
-    # Normalized color distance in HSV space
-    dh = min(abs(u_h - l_h), 180.0 - abs(u_h - l_h)) / 90.0
-    ds = abs(u_s - l_s) / 255.0
-    dv = abs(u_v - l_v) / 255.0
-    color_dist = float(np.sqrt(dh * dh + ds * ds + dv * dv))
-
     # Lower face edge density
     lower_gray = cv2.cvtColor(lower_crop, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(lower_gray, 50, 150)
     edge_density = float(np.sum(edges > 0)) / float(edges.size)
 
-    # Lip presence (skin/lip redness)
-    b, g, r = cv2.split(lower_crop.astype(np.float32))
-    lip_mask = (r > (g + 15)) & (r > (b + 15)) & (r > 60)
-    lip_ratio = float(np.sum(lip_mask)) / float(lower_crop.shape[0] * lower_crop.shape[1])
-
-    # Distinctive mask color signatures:
-    # 1. Surgical blue/cyan (75 <= H <= 130) or surgical green (35 <= H <= 75 with saturation)
-    is_surgical_tint = (75 <= l_h <= 130) or (35 <= l_h <= 75 and l_s > 40)
-    # 2. Neutral mask (white N95 or black fabric): low saturation compared to skin
-    is_neutral_mask = (l_s < 28 and (l_v > 175 or l_v < 60))
-
+    # Check if frame is monochrome / night-vision IR
+    is_monochrome = (u_s < 12.0 and l_s < 12.0)
     score = 0.0
-    if is_surgical_tint:
-        score += 0.55
-    elif is_neutral_mask:
-        score += 0.45
-    elif color_dist > 0.35:
-        score += min(0.40, (color_dist - 0.35) * 1.5)
 
-    # Edge density: masks have smooth cloth/synthetic texture (edge density < 0.045)
-    if edge_density < 0.045:
-        score += 0.35 * (1.0 - (edge_density / 0.045))
+    if is_monochrome:
+        u_gray = cv2.cvtColor(upper_crop, cv2.COLOR_BGR2GRAY)
+        l_std = float(np.std(lower_gray))
+        lum_diff = abs(u_v - l_v)
 
-    # Absence of natural lip redness in mouth area
-    if lip_ratio < 0.20:
-        score += 0.25 * (1.0 - (lip_ratio / 0.20))
+        # In IR/monochrome, smooth fabric (low edge density) and texture drop are essential
+        if edge_density < 0.040:
+            if l_std < 18.0 or lum_diff > 40.0:
+                score += 0.55
+                if edge_density < 0.020:
+                    score += 0.20 * (1.0 - (edge_density / 0.020))
+                if l_std < 12.0:
+                    score += 0.15 * (1.0 - (l_std / 12.0))
+        elif edge_density > 0.06:
+            # Clear lip, nostril, and mouth contours confirm unmasked face in IR
+            score = 0.0
+    else:
+        # Normalized color distance in HSV space
+        dh = min(abs(u_h - l_h), 180.0 - abs(u_h - l_h)) / 90.0
+        ds = abs(u_s - l_s) / 255.0
+        dv = abs(u_v - l_v) / 255.0
+        color_dist = float(np.sqrt(dh * dh + ds * ds + dv * dv))
+
+        # Lip presence (skin/lip redness)
+        b, g, r = cv2.split(lower_crop.astype(np.float32))
+        lip_mask = (r > (g + 15)) & (r > (b + 15)) & (r > 60)
+        lip_ratio = float(np.sum(lip_mask)) / float(lower_crop.shape[0] * lower_crop.shape[1])
+
+        # Distinctive mask color signatures:
+        # 1. Surgical blue/cyan (75 <= H <= 130) or surgical green (35 <= H <= 75 with saturation)
+        is_surgical_blue = (75 <= l_h <= 130 and l_s > 30 and (l_h - u_h > 35 or u_h < 30))
+        is_surgical_green = (35 <= l_h <= 75 and l_s > 35 and (l_h - u_h > 20 or u_h < 25))
+        is_surgical_tint = is_surgical_blue or is_surgical_green
+
+        # 2. Neutral mask (white N95, gray, or black fabric)
+        is_white_or_gray_mask = (l_s < 28 and (u_s - l_s) > 20 and l_v > 90)
+        is_black_mask = (l_v < 60 and (u_v - l_v) > 40)
+        is_neutral_mask = is_white_or_gray_mask or is_black_mask
+
+        # Color discrepancy is the primary indicator of a physical face mask in RGB
+        has_color_clue = is_surgical_tint or is_neutral_mask or (color_dist > 0.42)
+
+        if is_surgical_tint:
+            score += 0.55
+        elif is_neutral_mask:
+            score += 0.50
+        elif color_dist > 0.42:
+            score += min(0.40, (color_dist - 0.42) * 2.0)
+
+        # Edge density and lip absence corroborate a mask only when a color discrepancy is present
+        if has_color_clue:
+            if edge_density < 0.040:
+                score += 0.20 * (1.0 - (edge_density / 0.040))
+            if lip_ratio < 0.05:
+                score += 0.15 * (1.0 - (lip_ratio / 0.05))
+        elif lip_ratio > 0.02:
+            # Visible lips with matching skin tones confirm an unmasked face
+            score = max(0.0, score - 0.20)
 
     mask_score = min(1.0, max(0.0, score))
     is_masked = mask_score >= score_threshold
     return is_masked, mask_score
+
+
+def compute_eye_anchored_transform(landmarks: np.ndarray, dst_landmarks: Optional[np.ndarray] = None) -> np.ndarray:
+    """Compute analytical 2D similarity transform mapping 2 eye landmarks to canonical ArcFace template coordinates.
+
+    Uses closed-form complex division for maximum speed without external solvers or deprecation warnings.
+
+    Args:
+        landmarks: Array of shape (>=2, 2) containing left eye and right eye coordinates.
+        dst_landmarks: Canonical destination coordinates (defaults to ArcFace 112x112 eye landmarks).
+
+    Returns:
+        2x3 affine transformation matrix M.
+    """
+    if dst_landmarks is None:
+        # Canonical ArcFace 112x112 left and right eye coordinates
+        dst_landmarks = np.array([[38.2946, 51.6963], [73.5318, 51.5014]], dtype=np.float32)
+
+    p1, p2 = landmarks[0], landmarks[1]
+    d1, d2 = dst_landmarks[0], dst_landmarks[1]
+
+    dp = p2 - p1
+    dd = d2 - d1
+
+    denom = float(dp[0] * dp[0] + dp[1] * dp[1])
+    if denom <= 1e-7:
+        return np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+
+    # Complex division (dd[0] + i*dd[1]) / (dp[0] + i*dp[1])
+    a = float((dd[0] * dp[0] + dd[1] * dp[1]) / denom)
+    b = float((dd[1] * dp[0] - dd[0] * dp[1]) / denom)
+    c = float(d1[0] - (a * p1[0] - b * p1[1]))
+    d = float(d1[1] - (b * p1[0] + a * p1[1]))
+
+    return np.array([[a, -b, c], [b, a, d]], dtype=np.float32)
 
 
 def check_face_quality(
@@ -178,10 +305,12 @@ def check_face_quality(
     min_size: Tuple[int, int] = (config.REC_MIN_FACE_WIDTH, config.REC_MIN_FACE_HEIGHT),
     min_sharpness: float = config.REC_MIN_SHARPNESS,
     edge_margin: int = config.REC_EDGE_MARGIN_PX,
+    is_low_light: Optional[bool] = None,
 ) -> Tuple[bool, str]:
     """Verify facial crop quality, rejecting blur, poor lighting, extreme angles, and edge clipping.
 
-    Handles both unmasked faces and faces wearing surgical/cloth masks safely.
+    Handles both unmasked faces and faces wearing surgical/cloth masks safely across normal,
+    dark, and night-vision (IR) lighting conditions.
 
     Args:
         frame: Original full-resolution image/frame.
@@ -189,6 +318,7 @@ def check_face_quality(
         min_size: (min_width, min_height) required.
         min_sharpness: Minimum Laplacian variance for blur rejection.
         edge_margin: Minimum margin from frame boundaries.
+        is_low_light: Optional flag indicating dark or night-vision IR frame (auto-detected if None).
 
     Returns:
         Tuple of (is_valid: bool, reason: str).
@@ -224,28 +354,34 @@ def check_face_quality(
     mean_val = float(np.mean(gray))
     std_val = float(np.std(gray))
 
-    if mean_val < config.REC_MIN_BRIGHTNESS:
-        return False, f"Face underexposed ({mean_val:.1f} < {config.REC_MIN_BRIGHTNESS:.1f})"
+    # Auto-detect low-light condition if not explicitly supplied
+    if is_low_light is None:
+        is_low_light = bool(getattr(face, "is_low_light", False))
+        if not is_low_light:
+            sample = frame[::8, ::8]
+            sample_gray = cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY) if len(sample.shape) == 3 else sample
+            is_low_light = float(np.mean(sample_gray)) < config.LOW_LIGHT_BRIGHTNESS_THRESHOLD
+
+    # In low-light conditions, evaluate enhanced crop to verify quality after adaptive shadow lifting
+    eval_crop = crop
+    if is_low_light and mean_val < config.LOW_LIGHT_BRIGHTNESS_THRESHOLD:
+        crop_enh, _ = enhance_low_light_frame(crop)
+        gray_enh = cv2.cvtColor(crop_enh, cv2.COLOR_BGR2GRAY) if len(crop_enh.shape) == 3 else crop_enh
+        mean_val = float(np.mean(gray_enh))
+        std_val = float(np.std(gray_enh))
+        eval_crop = crop_enh
+
+    min_brightness = config.REC_MIN_BRIGHTNESS_LOW_LIGHT if is_low_light else config.REC_MIN_BRIGHTNESS
+    min_contrast = config.REC_MIN_CONTRAST_LOW_LIGHT if is_low_light else config.REC_MIN_CONTRAST
+
+    if mean_val < min_brightness:
+        return False, f"Face underexposed ({mean_val:.1f} < {min_brightness:.1f})"
     if mean_val > config.REC_MAX_BRIGHTNESS:
         return False, f"Face overexposed ({mean_val:.1f} > {config.REC_MAX_BRIGHTNESS:.1f})"
-    if std_val < config.REC_MIN_CONTRAST:
-        return False, f"Low contrast ({std_val:.1f} < {config.REC_MIN_CONTRAST:.1f})"
+    if std_val < min_contrast:
+        return False, f"Low contrast ({std_val:.1f} < {min_contrast:.1f})"
 
-    # 5. Blur / Sharpness check
-    sharpness = compute_sharpness(crop)
-    if sharpness < min_sharpness:
-        # If lower face is occluded by smooth mask cloth, evaluate sharpness on upper periocular region
-        is_masked = getattr(face, "is_masked", False)
-        upper_sharpness = 0.0
-        if is_masked and crop.shape[0] >= 20:
-            upper_crop = crop[: int(crop.shape[0] * 0.55), :]
-            upper_sharpness = compute_sharpness(upper_crop)
-        if upper_sharpness >= min_sharpness:
-            sharpness = upper_sharpness
-        else:
-            return False, f"Face blurry (sharpness {sharpness:.1f} < {min_sharpness:.1f})"
-
-    # 6. Extreme pose check (yaw asymmetry from 5 facial landmarks)
+    # 5. Extreme pose check (yaw asymmetry from 5 facial landmarks evaluated before blur)
     kps = getattr(face, "kps", None)
     if kps is not None and len(kps) >= 5:
         left_eye = kps[0]
@@ -258,6 +394,22 @@ def check_face_quality(
             yaw_ratio = abs(d_left - d_right) / eye_dist
             if yaw_ratio > config.REC_MAX_YAW_RATIO:
                 return False, f"Extreme head pose (yaw {yaw_ratio:.2f} > {config.REC_MAX_YAW_RATIO:.2f})"
+
+    # 6. Blur / Sharpness check
+    sharpness = compute_sharpness(eval_crop)
+    if sharpness < min_sharpness:
+        # If lower face is occluded by smooth mask cloth, evaluate sharpness on upper periocular region
+        is_masked = getattr(face, "is_masked", False)
+        if not is_masked:
+            is_masked, _ = compute_mask_probability(frame, face)
+        upper_sharpness = 0.0
+        if is_masked and eval_crop.shape[0] >= 20:
+            upper_crop = eval_crop[: int(eval_crop.shape[0] * 0.55), :]
+            upper_sharpness = compute_sharpness(upper_crop)
+        if upper_sharpness >= min_sharpness:
+            sharpness = upper_sharpness
+        else:
+            return False, f"Face blurry (sharpness {sharpness:.1f} < {min_sharpness:.1f})"
 
     return True, "Quality OK"
 
@@ -514,6 +666,7 @@ class FaceEngine:
             det_model = self._app.models["detection"]
             if getattr(det_model, "input_size", None) != target_size:
                 det_model.input_size = target_size
+                det_model.input_sizes = [target_size]
 
     def detect_faces(
         self,
@@ -525,12 +678,13 @@ class FaceEngine:
     ) -> List[Any]:
         """Detect faces in a BGR frame with configurable quality thresholds.
 
+        Handles normal daytime RGB, underexposed dark RGB, and monochrome/IR nighttime frames.
         When scale < 1.0, detection runs on the downscaled frame for maximum speed,
         while facial landmark coordinates are scaled back so ArcFace recognition
         extracts the feature embedding directly from the original full-resolution frame.
 
         Args:
-            frame: BGR image (from webcam or recorded video).
+            frame: BGR or grayscale image (from webcam, recorded video, or RTSP stream).
             scale: Downscaling factor for faster inference (e.g. 0.5).
             min_score: Minimum detection confidence threshold to accept.
             min_size: Minimum (width, height) bounding box size to accept.
@@ -542,6 +696,18 @@ class FaceEngine:
         self.ensure_ready()
         assert self._app is not None
 
+        if frame is None or frame.size == 0:
+            return []
+
+        # Ensure 3-channel BGR for InsightFace SCRFD and ArcFace (e.g. grayscale IR camera frames)
+        if len(frame.shape) == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.shape[2] == 1:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
+        # Detect and enhance underexposed low-light/night-vision frames
+        proc_frame, was_enhanced = enhance_low_light_frame(frame)
+
         # Configure detector resolution (defaulting to REC_DETECTION_SIZE for real-time throughput)
         target_size = det_size if det_size is not None else config.REC_DETECTION_SIZE
         self._set_detector_input_size(target_size)
@@ -550,7 +716,7 @@ class FaceEngine:
         rec_model = self._app.models.get("recognition")
 
         if scale < 1.0:
-            small_frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+            small_frame = cv2.resize(proc_frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
             bboxes, kpss = self._app.det_model.detect(small_frame)
             if bboxes.shape[0] == 0:
                 return []
@@ -574,18 +740,21 @@ class FaceEngine:
 
                 kps = scaled_kpss[i] if scaled_kpss is not None else None
                 face = Face(bbox=bbox, kps=kps, det_score=det_score)
+                face.is_low_light = was_enhanced
 
-                # Extract recognition embedding from full-resolution frame using mapped landmarks
+                # Extract recognition embedding from processed frame using mapped landmarks
                 if rec_model is not None:
-                    rec_model.get(frame, face)
+                    rec_model.get(proc_frame, face)
 
                 filtered_faces.append(face)
 
             if config.MASK_DETECTION_ENABLED:
                 for f in filtered_faces:
-                    is_m, m_sc = compute_mask_probability(frame, f)
+                    is_m, m_sc = compute_mask_probability(proc_frame, f)
                     f.is_masked = is_m
                     f.mask_score = m_sc
+                    if is_m:
+                        self._refine_masked_face_embedding(proc_frame, f)
             else:
                 for f in filtered_faces:
                     f.is_masked = False
@@ -594,7 +763,7 @@ class FaceEngine:
             return filtered_faces
 
         # Full resolution inference
-        raw_faces = self._app.get(frame)
+        raw_faces = self._app.get(proc_frame)
         filtered_faces = []
         for face in raw_faces:
             det_score = float(face.det_score)
@@ -606,19 +775,55 @@ class FaceEngine:
             height = y2 - y1
 
             if width >= min_w and height >= min_h:
+                face.is_low_light = was_enhanced
                 filtered_faces.append(face)
 
         if config.MASK_DETECTION_ENABLED:
             for f in filtered_faces:
-                is_m, m_sc = compute_mask_probability(frame, f)
+                is_m, m_sc = compute_mask_probability(proc_frame, f)
                 f.is_masked = is_m
                 f.mask_score = m_sc
+                if is_m:
+                    self._refine_masked_face_embedding(proc_frame, f)
         else:
             for f in filtered_faces:
                 f.is_masked = False
                 f.mask_score = 0.0
 
         return filtered_faces
+
+    def _refine_masked_face_embedding(self, frame: np.ndarray, face: Any) -> None:
+        """Refine feature embedding for masked faces using eye-anchored canonical alignment.
+
+        When the lower face (nose/mouth/chin) is covered by a mask, standard 5-point alignment
+        is distorted by occluded mouth landmark guesses. This extracts the canonical 112x112
+        crop aligned strictly on the visible left and right eye centers, then fuses this
+        periocular feature representation with the base embedding.
+        """
+        rec_model = self._app.models.get("recognition") if self._app is not None else None
+        if rec_model is None or getattr(face, "kps", None) is None or len(face.kps) < 2:
+            return
+
+        M_eye = compute_eye_anchored_transform(face.kps)
+        eye_crop = cv2.warpAffine(frame, M_eye, (112, 112), borderValue=0.0)
+        eye_feat = rec_model.get_feat(eye_crop).flatten()
+        eye_norm = float(np.linalg.norm(eye_feat))
+        if eye_norm <= 1e-7:
+            return
+
+        eye_emb = (eye_feat / eye_norm).astype(np.float32)
+        curr_emb = getattr(face, "normed_embedding", None)
+        if curr_emb is None and getattr(face, "embedding", None) is not None:
+            c_norm = float(np.linalg.norm(face.embedding))
+            curr_emb = (face.embedding / c_norm).astype(np.float32) if c_norm > 1e-7 else None
+
+        if curr_emb is not None:
+            fused = curr_emb + eye_emb
+            f_norm = float(np.linalg.norm(fused))
+            if f_norm > 1e-7:
+                face.embedding = (fused / f_norm).astype(np.float32)
+        else:
+            face.embedding = eye_emb
 
     def detect_face_mask(self, frame: np.ndarray, face: Any) -> Tuple[bool, float]:
         """Detect whether a face in the frame is wearing a face mask (surgical, N95, cloth, etc.).
@@ -716,23 +921,100 @@ class FaceEngine:
             x1, y1, x2, y2 = [int(v) for v in face.bbox]
             h_img, w_img = frame.shape[:2]
 
+            # 1. Edge boundary check (reject face clipped by frame borders)
+            edge_margin = config.REG_EDGE_MARGIN_PX
+            if x1 <= edge_margin or y1 <= edge_margin or x2 >= (w_img - edge_margin) or y2 >= (h_img - edge_margin):
+                return (
+                    None,
+                    "Face is partially outside the frame. Please center your face in the camera.",
+                    (x1, y1, x2, y2),
+                )
+
             x1_cl = max(0, x1)
             y1_cl = max(0, y1)
             x2_cl = min(w_img, x2)
             y2_cl = min(h_img, y2)
 
             face_crop = frame[y1_cl:y2_cl, x1_cl:x2_cl]
-
-            # Blur / sharpness check
-            sharpness = compute_sharpness(face_crop)
-            if sharpness < config.REG_MIN_SHARPNESS:
+            if face_crop is None or face_crop.size == 0 or face_crop.shape[0] < 5 or face_crop.shape[1] < 5:
                 return (
                     None,
-                    f"Face image is too blurry (sharpness: {sharpness:.1f} < {config.REG_MIN_SHARPNESS:.1f}). Ensure a steady camera and good lighting.",
+                    "Invalid face crop. Ensure your face is clearly visible in the camera.",
                     (x1, y1, x2, y2),
                 )
 
-            # Enforce that the registered subject is not wearing a mask
+            # 2. Lighting: Brightness & Contrast (evaluated first as low brightness degrades Laplacian response)
+            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY) if len(face_crop.shape) == 3 else face_crop
+            mean_val = float(np.mean(gray))
+            std_val = float(np.std(gray))
+
+            if mean_val < config.REG_MIN_BRIGHTNESS:
+                return (
+                    None,
+                    f"Face image is too dark (brightness: {mean_val:.1f} < {config.REG_MIN_BRIGHTNESS:.1f}). Please improve lighting.",
+                    (x1, y1, x2, y2),
+                )
+            if mean_val > config.REG_MAX_BRIGHTNESS:
+                return (
+                    None,
+                    f"Face image is overexposed (brightness: {mean_val:.1f} > {config.REG_MAX_BRIGHTNESS:.1f}). Reduce glare or harsh backlighting.",
+                    (x1, y1, x2, y2),
+                )
+            if std_val < config.REG_MIN_CONTRAST:
+                return (
+                    None,
+                    f"Face image has low contrast (contrast: {std_val:.1f} < {config.REG_MIN_CONTRAST:.1f}). Ensure clear and balanced lighting.",
+                    (x1, y1, x2, y2),
+                )
+
+            # 3. Head pose & angle check (evaluated before blur so turned heads are not falsely reported as blurry)
+            kps = getattr(face, "kps", None)
+            if kps is not None and len(kps) >= 5:
+                left_eye = kps[0]
+                right_eye = kps[1]
+                nose = kps[2]
+                eye_dist = float(np.linalg.norm(right_eye - left_eye))
+                if eye_dist > 5.0:
+                    d_left = float(np.linalg.norm(nose - left_eye))
+                    d_right = float(np.linalg.norm(nose - right_eye))
+                    yaw_ratio = abs(d_left - d_right) / eye_dist
+                    if yaw_ratio > config.REG_MAX_YAW_RATIO:
+                        return (
+                            None,
+                            f"Head is turned at an angle (yaw: {yaw_ratio:.2f} > {config.REG_MAX_YAW_RATIO:.2f}). Please face the camera directly.",
+                            (x1, y1, x2, y2),
+                        )
+                    # Vertical head tilt / roll check
+                    dy = abs(float(right_eye[1] - left_eye[1]))
+                    tilt_ratio = dy / eye_dist
+                    if tilt_ratio > config.REG_MAX_ROLL_TILT:
+                        return (
+                            None,
+                            f"Head is tilted sideways. Please keep your head upright and level.",
+                            (x1, y1, x2, y2),
+                        )
+
+            # 4. Blur / sharpness check: assess actual image detail on face crop and facial feature region
+            crop_sharpness = compute_sharpness(face_crop)
+            feat_sharpness = 0.0
+            if kps is not None and len(kps) >= 5:
+                kx1 = max(0, int(np.min(kps[:, 0])) - 8)
+                ky1 = max(0, int(np.min(kps[:, 1])) - 8)
+                kx2 = min(w_img, int(np.max(kps[:, 0])) + 8)
+                ky2 = min(h_img, int(np.max(kps[:, 1])) + 8)
+                if kx2 > kx1 + 10 and ky2 > ky1 + 10:
+                    feat_crop = frame[ky1:ky2, kx1:kx2]
+                    feat_sharpness = compute_sharpness(feat_crop)
+
+            effective_sharpness = max(crop_sharpness, feat_sharpness)
+            if effective_sharpness < config.REG_MIN_SHARPNESS:
+                return (
+                    None,
+                    f"Face image is too blurry (sharpness: {effective_sharpness:.1f} < {config.REG_MIN_SHARPNESS:.1f}). Ensure a steady camera and good lighting.",
+                    (x1, y1, x2, y2),
+                )
+
+            # 5. Enforce that the registered subject is not wearing a mask
             if config.MASK_DETECTION_ENABLED:
                 is_masked = getattr(face, "is_masked", None)
                 if is_masked is None:
@@ -795,8 +1077,7 @@ class FaceEngine:
 
         Achieves 60x+ faster comparison than Python loops.
         Never alters registry or writes to storage. Returns the recognized identity
-        only when cosine similarity meets the threshold; otherwise 'Unknown Person'
-        or 'Unknown Person [Masked]'.
+        only when cosine similarity meets the threshold; otherwise 'Unknown Person'.
         """
         if threshold is None:
             threshold = config.MASKED_SIMILARITY_THRESHOLD if is_masked else config.SIMILARITY_THRESHOLD
@@ -835,7 +1116,7 @@ class FaceEngine:
         if min_margin is None:
             min_margin = config.MASKED_MATCH_AMBIGUITY_MARGIN if is_masked else config.MATCH_AMBIGUITY_MARGIN
 
-        unknown_label = "Unknown Person" if is_masked else "Unknown Person"
+        unknown_label = "Unknown Person"
 
         if not registry:
             return unknown_label, 0.0, False
@@ -925,7 +1206,7 @@ class FaceEngine:
             eff_margin = min_margin if min_margin is not None else (
                 config.MASKED_MATCH_AMBIGUITY_MARGIN if is_masked else config.MATCH_AMBIGUITY_MARGIN
             )
-            unknown_label = "Unknown Person" if is_masked else "Unknown Person"
+            unknown_label = "Unknown Person"
 
             if best_score < eff_thresh:
                 results.append((unknown_label, max(0.0, best_score), False))

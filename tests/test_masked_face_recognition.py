@@ -152,7 +152,7 @@ class TestMaskedFaceRecognition(unittest.TestCase):
         self.assertFalse(is_amb)
 
     def test_06_masked_imposter_rejection(self):
-        """Verify that an unregistered person wearing a mask is safely rejected as Unknown Person [Masked]."""
+        """Verify that an unregistered person wearing a mask is safely rejected as Unknown Person."""
         # Register Alice (faces_orig[2]) only; query with masked lead_face (Tom Hanks wearing a mask)
         registry = {"Alice": self.faces_orig[2].normed_embedding}
         masked_img = self._create_masked_image(self.t1, self.lead_face, (210, 180, 70))
@@ -172,13 +172,14 @@ class TestMaskedFaceRecognition(unittest.TestCase):
                 break
 
         self.assertIsNotNone(target_face)
+        self.assertTrue(target_face.is_masked)
         ident, score, _ = self.engine.match_face_detailed(
             target_face.normed_embedding,
             registry,
             is_masked=True,
         )
 
-        self.assertEqual(ident, "Unknown Person [Masked]")
+        self.assertEqual(ident, "Unknown Person")
         self.assertLess(score, config.MASKED_SIMILARITY_THRESHOLD)
 
     def test_07_registration_rejects_masked_faces(self):
@@ -324,8 +325,8 @@ class TestMaskedFaceRecognition(unittest.TestCase):
         self.assertEqual(results[1][0], "Tom_Hanks")
         self.assertGreaterEqual(results[1][1], config.MASKED_SIMILARITY_THRESHOLD)
 
-        # Query 3 rejected as Unknown Person [Masked]
-        self.assertEqual(results[2][0], "Unknown Person [Masked]")
+        # Query 3 rejected as Unknown Person
+        self.assertEqual(results[2][0], "Unknown Person")
 
     def test_14_ambiguity_margin_rejection(self):
         """Verify that ambiguous embeddings with near-identical similarity are safely rejected."""
@@ -362,6 +363,33 @@ class TestMaskedFaceRecognition(unittest.TestCase):
         avg_latency = float(np.mean(latencies))
         self.assertLess(avg_latency, 500.0, f"Average inference too slow: {avg_latency:.1f}ms")
 
+    def test_16_eye_anchored_masked_face_refinement(self):
+        """Verify that masked face embedding refinement elevates genuine recognition confidence."""
+        registry = {"Tom_Hanks": self.lead_face.normed_embedding}
+        masked_img = self._create_masked_image(self.t1, self.lead_face, (210, 180, 70))
+        faces = self.engine.detect_faces(masked_img)
+
+        # Locate corresponding face
+        target_face = None
+        bx1, by1, bx2, by2 = [int(v) for v in self.lead_face.bbox]
+        for f in faces:
+            mb = f.bbox
+            ix1, iy1 = max(bx1, mb[0]), max(by1, mb[1])
+            ix2, iy2 = min(bx2, mb[2]), min(by2, mb[3])
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            union = (bx2 - bx1) * (by2 - by1) + (mb[2] - mb[0]) * (mb[3] - mb[1]) - inter
+            if inter / max(1.0, union) > 0.5:
+                target_face = f
+                break
+
+        self.assertIsNotNone(target_face)
+        # Must recognize Tom_Hanks and return his registered identity
+        ident, score = self.engine.match_face(target_face.normed_embedding, registry, is_masked=target_face.is_masked)
+        self.assertEqual(ident, "Tom_Hanks")
+        self.assertGreater(score, 0.60)
+        self.assertTrue(target_face.is_masked)
+
 
 if __name__ == "__main__":
     unittest.main()
+

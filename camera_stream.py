@@ -41,26 +41,44 @@ def build_rtsp_url(
     ip_address: str,
     port: Any = 554,
     stream_path: str = "",
+    scheme: Optional[str] = None,
 ) -> str:
-    """Construct a clean, valid RTSP URL from exactly five user-provided inputs.
+    """Construct a clean, valid stream URL (RTSP, HTTP, HTTPS) from user inputs.
 
     Performs per-component URL encoding for username and password to prevent
-    special characters (e.g. '@', ':', '/', '%', spaces) from breaking the URI syntax,
-    without encoding the whole URL string.
+    special characters (e.g. '@', ':', '/', '%', spaces) from breaking the URI syntax.
+    Supports full stream URLs directly (e.g. 'http://192.168.1.14:8080/video') as well
+    as individual component configuration.
 
     Args:
         username: Camera/DVR login username.
         password: Camera/DVR login password.
-        ip_address: Camera/DVR host or IPv4 address.
-        port: RTSP port (defaults to 554).
-        stream_path: Vendor/channel stream path (e.g. '/live/ch0' or 'h264Preview_01_main').
+        ip_address: Camera/DVR host, IPv4 address, or full stream URL.
+        port: Stream port (defaults to 554).
+        stream_path: Vendor/channel stream path (e.g. '/live/ch0', '/video').
+        scheme: Optional URL scheme override ('rtsp', 'http', 'https').
 
     Returns:
-        Properly structured RTSP URL string: rtsp://username:password@IP:PORT/PATH
+        Properly structured stream URL string.
     """
     user_clean = username.strip() if username else ""
     pass_clean = password.strip() if password else ""
     ip_clean = ip_address.strip() if ip_address else ""
+
+    # If already a full URL scheme, parse and respect its components
+    if ip_clean.lower().startswith(("http://", "https://", "rtsp://", "rtsps://", "rtmp://")):
+        parts = urlsplit(ip_clean)
+        u = user_clean or parts.username or ""
+        p = pass_clean or parts.password or ""
+        host = parts.hostname or ""
+        port_num = parts.port
+        path = parts.path or (("/" + stream_path.lstrip("/")) if stream_path else "/")
+
+        enc_user = quote(u, safe="")
+        enc_pass = quote(p, safe="")
+        auth = f"{enc_user}:{enc_pass}@" if enc_user or enc_pass else ""
+        port_part = f":{port_num}" if port_num else ""
+        return f"{parts.scheme}://{auth}{host}{port_part}{path}"
 
     # Handle port input
     port_str = str(port).strip() if port is not None else ""
@@ -91,7 +109,8 @@ def build_rtsp_url(
     else:
         auth_section = ""
 
-    return f"rtsp://{auth_section}{ip_clean}:{port_str}{clean_path}"
+    chosen_scheme = scheme or ("http" if port_str == "8080" else "rtsp")
+    return f"{chosen_scheme}://{auth_section}{ip_clean}:{port_str}{clean_path}"
 
 
 def mask_stream_credentials(url: str) -> str:
@@ -204,7 +223,9 @@ def test_rtsp_connection(
                 w, h = pyav_src.get_resolution()
                 pyav_src.release()
                 if ret and frame is not None and frame.size > 0:
-                    return True, f"Connection successful via PyAV! Video stream active ({w}x{h} px).", (w, h)
+                    mean_lum = float(np.mean(frame))
+                    lum_note = f" [Warning: Stream is very dark, mean brightness: {mean_lum:.1f}/255. Turn on phone torch/light or night mode for face detection]" if mean_lum < 15.0 else ""
+                    return True, f"Connection successful via PyAV! Video stream active ({w}x{h} px){lum_note}.", (w, h)
                 else:
                     return False, "Unable to read video frames. The camera stream opened but produced no image data.", None
             # If pyav open returns False and backend is forced pyav:
@@ -245,7 +266,39 @@ def test_rtsp_connection(
 
     h, w = frame.shape[:2]
     backend_note = "OpenCV (Fallback)" if tried_pyav else "OpenCV"
-    return True, f"Connection successful via {backend_note}! Video stream active ({w}x{h} px).", (w, h)
+    mean_lum = float(np.mean(frame))
+    lum_note = f" [Warning: Stream is very dark, mean brightness: {mean_lum:.1f}/255. Turn on phone torch/light or night mode for face detection]" if mean_lum < 15.0 else ""
+    return True, f"Connection successful via {backend_note}! Video stream active ({w}x{h} px){lum_note}.", (w, h)
+
+
+def toggle_ipcamera_torch(url: str, enable: Optional[bool] = None) -> Tuple[bool, str]:
+    """Send an HTTP torch/flashlight toggle request to an IP Webcam phone camera.
+
+    Supports the standard IP Webcam Android endpoints (/enabletorch, /disabletorch).
+    Safe and non-throwing: returns (success, message).
+
+    Args:
+        url: Camera stream URL (e.g. 'http://192.168.1.14:8080/video').
+        enable: True to enable, False to disable, None to toggle / enable.
+
+    Returns:
+        Tuple of (success: bool, status_message: str).
+    """
+    import urllib.request
+    try:
+        parts = urlsplit(url)
+        if not parts.scheme.startswith("http"):
+            return False, "Flashlight control is only supported for HTTP/HTTPS phone IP camera streams."
+        base = f"{parts.scheme}://{parts.netloc}"
+        endpoint = "/enabletorch" if (enable is True or enable is None) else "/disabletorch"
+        req = urllib.request.Request(f"{base}{endpoint}", headers={"User-Agent": "FaceMatch/1.0"})
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            if resp.status == 200:
+                state = "enabled" if "enable" in endpoint else "disabled"
+                return True, f"Phone camera torch successfully {state}."
+            return False, f"Server responded with status {resp.status}."
+    except Exception as e:
+        return False, f"Could not toggle phone torch: {e}"
 
 
 def load_cctv_config(config_path: Path = config.CCTV_CONFIG_PATH) -> Optional[Dict[str, Any]]:

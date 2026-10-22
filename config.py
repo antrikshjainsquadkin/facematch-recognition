@@ -77,7 +77,8 @@ REC_MIN_BRIGHTNESS: float = 32.0    # Minimum average pixel luminance (darkness 
 REC_MAX_BRIGHTNESS: float = 228.0   # Maximum average pixel luminance (overexposure rejection)
 REC_MIN_CONTRAST: float = 14.0      # Minimum grayscale std-dev (flat region rejection for normal lighting)
 REC_EDGE_MARGIN_PX: int = 4         # Border margin in pixels; faces touching edge are rejected
-REC_MAX_YAW_RATIO: float = 0.75     # Extreme side-profile pose rejection from 5 facial landmarks
+REC_MAX_YAW_RATIO: float = 0.90     # Extreme side-profile pose rejection for recognition (allows natural turns up to ~60 deg)
+REC_MAX_YAW_RATIO_MASKED: float = 0.95  # Yaw ratio threshold for masked faces (accommodates mask-induced nose landmark displacement)
 
 # ==========================================
 # Dark RGB & Night-Vision / IR Settings
@@ -160,7 +161,7 @@ DEFAULT_RTSP_PORT: int = 554
 RTSP_CONNECT_TIMEOUT_SEC: float = 5.0
 
 # Can be set via environment variable FACEMATCH_OFFICE_CAMERA_URL or entered interactively.
-OFFICE_CAMERA_URL: str = os.getenv("FACEMATCH_OFFICE_CAMERA_URL", "").strip()
+OFFICE_CAMERA_URL: str = os.getenv("FACEMATCH_OFFICE_CAMERA_URL", "http://192.168.1.14:8080/video").strip()
 RTSP_TRANSPORT: str = "tcp"  # TCP transport avoids UDP packet loss and corrupted frames
 STREAM_TIMEOUT_SEC: float = 8.0  # Seconds without new frame before triggering reconnection
 STREAM_RECONNECT_INTERVAL_SEC: float = 3.0  # Backoff delay between reconnection attempts

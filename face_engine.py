@@ -382,6 +382,10 @@ def check_face_quality(
         return False, f"Low contrast ({std_val:.1f} < {min_contrast:.1f})"
 
     # 5. Extreme pose check (yaw asymmetry from 5 facial landmarks evaluated before blur)
+    is_masked = getattr(face, "is_masked", False)
+    if not is_masked and config.MASK_DETECTION_ENABLED:
+        is_masked, _ = compute_mask_probability(frame, face)
+
     kps = getattr(face, "kps", None)
     if kps is not None and len(kps) >= 5:
         left_eye = kps[0]
@@ -392,24 +396,36 @@ def check_face_quality(
             d_left = float(np.linalg.norm(nose - left_eye))
             d_right = float(np.linalg.norm(nose - right_eye))
             yaw_ratio = abs(d_left - d_right) / eye_dist
-            if yaw_ratio > config.REC_MAX_YAW_RATIO:
-                return False, f"Extreme head pose (yaw {yaw_ratio:.2f} > {config.REC_MAX_YAW_RATIO:.2f})"
+            max_yaw = getattr(config, "REC_MAX_YAW_RATIO_MASKED", 0.95) if is_masked else config.REC_MAX_YAW_RATIO
+            if yaw_ratio > max_yaw:
+                return False, f"Extreme head pose (yaw {yaw_ratio:.2f} > {max_yaw:.2f})"
 
     # 6. Blur / Sharpness check
     sharpness = compute_sharpness(eval_crop)
     if sharpness < min_sharpness:
-        # If lower face is occluded by smooth mask cloth, evaluate sharpness on upper periocular region
-        is_masked = getattr(face, "is_masked", False)
-        if not is_masked:
-            is_masked, _ = compute_mask_probability(frame, face)
-        upper_sharpness = 0.0
-        if is_masked and eval_crop.shape[0] >= 20:
-            upper_crop = eval_crop[: int(eval_crop.shape[0] * 0.55), :]
-            upper_sharpness = compute_sharpness(upper_crop)
-        if upper_sharpness >= min_sharpness:
-            sharpness = upper_sharpness
+        # Check facial feature region so turned faces with sharp eyes are not penalized by smooth cheek/background
+        feat_sharpness = 0.0
+        if kps is not None and len(kps) >= 5:
+            kx1 = max(0, int(np.min(kps[:, 0])) - 4)
+            ky1 = max(0, int(np.min(kps[:, 1])) - 4)
+            kx2 = min(w_img, int(np.max(kps[:, 0])) + 4)
+            ky2 = min(h_img, int(np.max(kps[:, 1])) + 4)
+            if kx2 > kx1 + 10 and ky2 > ky1 + 10:
+                feat_crop = frame[ky1:ky2, kx1:kx2]
+                feat_sharpness = compute_sharpness(feat_crop)
+
+        if feat_sharpness >= min_sharpness:
+            sharpness = feat_sharpness
         else:
-            return False, f"Face blurry (sharpness {sharpness:.1f} < {min_sharpness:.1f})"
+            # If lower face is occluded by smooth mask cloth, evaluate sharpness on upper periocular region
+            upper_sharpness = 0.0
+            if is_masked and eval_crop.shape[0] >= 20:
+                upper_crop = eval_crop[: int(eval_crop.shape[0] * 0.55), :]
+                upper_sharpness = compute_sharpness(upper_crop)
+            if upper_sharpness >= min_sharpness:
+                sharpness = upper_sharpness
+            else:
+                return False, f"Face blurry (sharpness {sharpness:.1f} < {min_sharpness:.1f})"
 
     return True, "Quality OK"
 

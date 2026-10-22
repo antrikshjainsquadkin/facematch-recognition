@@ -390,6 +390,112 @@ class TestMaskedFaceRecognition(unittest.TestCase):
         self.assertTrue(target_face.is_masked)
 
 
+    def _create_turned_face_image(self, img: np.ndarray, face, yaw_factor: float) -> np.ndarray:
+        """Helper to create realistic 3D yaw perspective foreshortening on a face crop."""
+        bx1, by1, bx2, by2 = [int(v) for v in face.bbox]
+        crop = img[by1:by2, bx1:bx2]
+        ch, cw = crop.shape[:2]
+        yf = abs(yaw_factor)
+        src = np.float32([[0, 0], [cw, 0], [cw, ch], [0, ch]])
+        if yaw_factor > 0:
+            dst = np.float32([
+                [0, ch * yf * 0.30],
+                [cw * (1.0 - yf * 0.40), ch * yf * 0.10],
+                [cw * (1.0 - yf * 0.40), ch * (1.0 - yf * 0.10)],
+                [0, ch * (1.0 - yf * 0.30)]
+            ])
+        else:
+            dst = np.float32([
+                [cw * yf * 0.40, ch * yf * 0.10],
+                [cw, ch * yf * 0.30],
+                [cw, ch * (1.0 - yf * 0.30)],
+                [cw * yf * 0.40, ch * (1.0 - yf * 0.10)]
+            ])
+        H = cv2.getPerspectiveTransform(src, dst)
+        warped = cv2.warpPerspective(crop, H, (cw, ch))
+        canvas = img.copy()
+        canvas[by1:by2, bx1:bx2] = warped
+        return canvas
+
+    def test_17_head_turned_left_and_right_unmasked(self):
+        """Verify recognition of registered subject when head is turned left or right (~35 deg)."""
+        registry = {"Tom_Hanks": self.lead_face.normed_embedding}
+        target_center = np.array([(self.lead_face.bbox[0] + self.lead_face.bbox[2]) / 2,
+                                  (self.lead_face.bbox[1] + self.lead_face.bbox[3]) / 2])
+
+        for yaw in [-0.35, 0.35]:
+            turned_img = self._create_turned_face_image(self.t1, self.lead_face, yaw)
+            faces = self.engine.detect_faces(turned_img)
+            target = None
+            for f in faces:
+                c = np.array([(f.bbox[0] + f.bbox[2]) / 2, (f.bbox[1] + f.bbox[3]) / 2])
+                if np.linalg.norm(c - target_center) < 50:
+                    target = f
+                    break
+            self.assertIsNotNone(target, f"Face should be detected at yaw {yaw}")
+            is_ok, reason = check_face_quality(turned_img, target)
+            self.assertTrue(is_ok, f"Quality gate should accept turned face (reason: {reason})")
+            ident, score = self.engine.match_face(target.normed_embedding, registry, is_masked=False)
+            self.assertEqual(ident, "Tom_Hanks")
+            self.assertGreater(score, config.SIMILARITY_THRESHOLD)
+
+    def test_18_head_turned_left_and_right_masked(self):
+        """Verify recognition of registered subject when head is turned with a mask."""
+        registry = {"Tom_Hanks": self.lead_face.normed_embedding}
+        target_center = np.array([(self.lead_face.bbox[0] + self.lead_face.bbox[2]) / 2,
+                                  (self.lead_face.bbox[1] + self.lead_face.bbox[3]) / 2])
+
+        for yaw in [-0.35, 0.35]:
+            turned_img = self._create_turned_face_image(self.t1, self.lead_face, yaw)
+            det = self.engine.detect_faces(turned_img)
+            target_unmasked = None
+            for f in det:
+                c = np.array([(f.bbox[0] + f.bbox[2]) / 2, (f.bbox[1] + f.bbox[3]) / 2])
+                if np.linalg.norm(c - target_center) < 50:
+                    target_unmasked = f
+                    break
+            self.assertIsNotNone(target_unmasked)
+            masked_turned_img = self._create_masked_image(turned_img, target_unmasked, (200, 160, 60))
+            faces_m = self.engine.detect_faces(masked_turned_img)
+            target_m = None
+            for f in faces_m:
+                c = np.array([(f.bbox[0] + f.bbox[2]) / 2, (f.bbox[1] + f.bbox[3]) / 2])
+                if np.linalg.norm(c - target_center) < 50:
+                    target_m = f
+                    break
+            self.assertIsNotNone(target_m, f"Masked turned face should be detected at yaw {yaw}")
+            is_ok, reason = check_face_quality(masked_turned_img, target_m)
+            self.assertTrue(is_ok, f"Quality gate should accept turned masked face: {reason}")
+            ident, score = self.engine.match_face(target_m.normed_embedding, registry, is_masked=True)
+            self.assertEqual(ident, "Tom_Hanks")
+            self.assertGreater(score, config.MASKED_SIMILARITY_THRESHOLD)
+
+    def test_19_turned_imposter_rejected(self):
+        """Verify that an unknown person turned sideways (with or without mask) is rejected as Unknown Person."""
+        registry = {"Tom_Hanks": self.lead_face.normed_embedding}
+        other_face = None
+        for f in self.faces_orig:
+            if f.bbox[0] < 600 and f.bbox[0] > 400:
+                other_face = f
+                break
+        self.assertIsNotNone(other_face)
+        other_center = np.array([(other_face.bbox[0] + other_face.bbox[2]) / 2,
+                                 (other_face.bbox[1] + other_face.bbox[3]) / 2])
+        turned_other_img = self._create_turned_face_image(self.t1, other_face, 0.40)
+        det = self.engine.detect_faces(turned_other_img)
+        target_other = None
+        for f in det:
+            c = np.array([(f.bbox[0] + f.bbox[2]) / 2, (f.bbox[1] + f.bbox[3]) / 2])
+            if np.linalg.norm(c - other_center) < 50:
+                target_other = f
+                break
+        self.assertIsNotNone(target_other)
+        ident, score = self.engine.match_face(target_other.normed_embedding, registry, is_masked=False)
+        self.assertEqual(ident, "Unknown Person")
+        self.assertLess(score, config.SIMILARITY_THRESHOLD)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

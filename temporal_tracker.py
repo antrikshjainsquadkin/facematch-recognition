@@ -262,8 +262,8 @@ class TemporalRecognitionTracker:
                         trk.event_emitted = True
                         trk.last_event_time = now
                         self._active_identities.add(top_id)
-                elif trk.confirmed_identity == top_id and trk.consecutive_unknown_count <= 2:
-                    # Maintain confirmed identity across transient 1-2 frame dip on the same verified track
+                elif trk.confirmed_identity == top_id and trk.consecutive_unknown_count <= 4:
+                    # Maintain confirmed identity across transient 1-4 frame head-turn dip on the same verified track
                     final_identity = top_id
                     final_score = avg_score
                     is_confirmed = True
@@ -271,8 +271,8 @@ class TemporalRecognitionTracker:
                     # Still verifying across frames
                     final_identity = f"Verifying ({top_id})..."
                     final_score = avg_score
-            elif trk.confirmed_identity is not None and not is_ambiguous and trk.consecutive_unknown_count <= 2:
-                # Maintain confirmed identity across transient 1-2 frame dip on the same verified track
+            elif trk.confirmed_identity is not None and not is_ambiguous and trk.consecutive_unknown_count <= 4:
+                # Maintain confirmed identity across transient 1-4 frame head-turn dip on the same verified track
                 trk.consecutive_unknown_count += 1
                 final_identity = trk.confirmed_identity
                 is_confirmed = True

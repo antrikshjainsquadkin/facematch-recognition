@@ -37,6 +37,7 @@ from camera_stream import (
     load_cctv_config,
     save_cctv_config,
     clear_cctv_config,
+    toggle_ipcamera_torch,
 )
 from temporal_tracker import TemporalRecognitionTracker
 
@@ -783,11 +784,22 @@ def prompt_cctv_five_inputs(existing: Optional[Dict[str, Any]] = None) -> Tuple[
     if not password and has_pwd:
         password = existing.get("password", "")
 
-    # 3. IP Address
-    ip_prompt = f"3. IP Address [{ex_ip}]: " if ex_ip else "3. IP Address: "
-    ip_address = input(ip_prompt).strip()
-    if not ip_address and ex_ip:
-        ip_address = ex_ip
+    # 3. IP Address or Stream URL
+    ip_prompt = f"3. IP Address or Stream URL [{ex_ip}]: " if ex_ip else "3. IP Address or Stream URL: "
+    ip_raw = input(ip_prompt).strip()
+    if not ip_raw and ex_ip:
+        ip_raw = ex_ip
+
+    if ip_raw.lower().startswith(("http://", "https://", "rtsp://", "rtsps://")):
+        from urllib.parse import urlsplit
+        p = urlsplit(ip_raw)
+        ip_address = p.hostname or ip_raw
+        if p.port:
+            ex_port = str(p.port)
+        if p.path:
+            ex_path = p.path
+    else:
+        ip_address = ip_raw
 
     # 4. Port
     port_prompt = f"4. Port [{ex_port}]: "
@@ -795,7 +807,7 @@ def prompt_cctv_five_inputs(existing: Optional[Dict[str, Any]] = None) -> Tuple[
     port = port_raw if port_raw else ex_port
 
     # 5. Stream Path
-    path_prompt = f"5. Stream Path [{ex_path}]: " if ex_path else "5. Stream Path (e.g. /live/ch0): "
+    path_prompt = f"5. Stream Path [{ex_path}]: " if ex_path else "5. Stream Path (e.g. /live/ch0, /video): "
     stream_path = input(path_prompt).strip()
     if not stream_path and ex_path:
         stream_path = ex_path
@@ -821,7 +833,22 @@ def cctv_camera_menu(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> Non
     """
     saved_cfg = load_cctv_config() or {}
 
-    # If no configuration exists yet, prompt immediately
+    # If no configuration exists yet, pre-populate from config.OFFICE_CAMERA_URL if configured
+    if not saved_cfg.get("ip_address") and config.OFFICE_CAMERA_URL:
+        from urllib.parse import urlsplit
+        p = urlsplit(config.OFFICE_CAMERA_URL)
+        saved_cfg = {
+            "username": p.username or "",
+            "password": p.password or "",
+            "ip_address": p.hostname or config.OFFICE_CAMERA_URL,
+            "port": str(p.port or (8080 if p.scheme == "http" else config.DEFAULT_RTSP_PORT)),
+            "stream_path": p.path or "/video",
+            "scheme": p.scheme or "http",
+            "video_backend": "auto",
+        }
+        save_cctv_config(saved_cfg)
+
+    # If still no configuration exists, prompt user
     if not saved_cfg.get("ip_address"):
         user, pwd, ip, port, path = prompt_cctv_five_inputs(saved_cfg)
         if not ip:
@@ -834,6 +861,7 @@ def cctv_camera_menu(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> Non
             "ip_address": ip,
             "port": port,
             "stream_path": path,
+            "scheme": "http" if str(port) == "8080" else "rtsp",
         }
 
         save_choice = input("Do you want to save these settings locally in gitignored file? (y/n): ").strip().lower()
@@ -849,8 +877,9 @@ def cctv_camera_menu(engine: FaceEngine, registry: Dict[str, np.ndarray]) -> Non
         ip = saved_cfg.get("ip_address", "")
         port = saved_cfg.get("port", config.DEFAULT_RTSP_PORT)
         path = saved_cfg.get("stream_path", "")
+        scheme = saved_cfg.get("scheme", "http" if str(port) == "8080" else "rtsp")
 
-        rtsp_url = build_rtsp_url(user, pwd, ip, port, path)
+        rtsp_url = build_rtsp_url(user, pwd, ip, port, path, scheme=scheme)
         masked_url = mask_stream_credentials(rtsp_url)
 
         print("\n==================================================")
@@ -954,7 +983,8 @@ def run_cctv_recognition(
     masked_url = mask_stream_credentials(rtsp_url)
     print(f"\n[CCTV Camera] Connecting to: {masked_url} (Backend: {backend.upper()})")
     print("Controls:")
-    print(" - Press [Q] or [ESC] in the camera window to Disconnect and return.\n")
+    print(" - Press [Q] or [ESC] in the camera window to Disconnect and return.")
+    print(" - Press [F] to toggle phone flashlight/torch (for IP Camera streams).\n")
 
     engine.ensure_ready()
 
@@ -973,6 +1003,7 @@ def run_cctv_recognition(
     cached_results: List[Tuple[Tuple[int, int, int, int], Tuple[int, int, int], str]] = []
     fps_smooth = 0.0
     t_prev_frame = time.perf_counter()
+    torch_state = {"enabled": False}
 
     try:
         # Give stream grabber a moment to establish connection
@@ -1074,14 +1105,32 @@ def run_cctv_recognition(
             cv2.rectangle(display_frame, (0, 0), (w, 32), (30, 30, 30), -1)
             cv2.putText(
                 display_frame,
-                f"CCTV [{reader.active_backend}]: {masked_url} | Enrolled: {len(registry)} | Live: {fps_smooth:.1f} FPS | [Q] Disconnect",
+                f"CCTV [{reader.active_backend}]: {masked_url} | Enrolled: {len(registry)} | Live: {fps_smooth:.1f} FPS | [Q] Exit | [F] Torch",
                 (10, 22),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
+                0.46,
                 (255, 255, 255),
                 1,
                 cv2.LINE_AA,
             )
+
+            # Warning overlay if environment is severely dark
+            sample_sub = display_frame[::16, ::16]
+            sample_gray = cv2.cvtColor(sample_sub, cv2.COLOR_BGR2GRAY) if len(sample_sub.shape) == 3 else sample_sub
+            mean_frame_lum = float(np.mean(sample_gray))
+
+            if mean_frame_lum < 15.0:
+                cv2.rectangle(display_frame, (0, 32), (w, 58), (0, 0, 180), -1)
+                cv2.putText(
+                    display_frame,
+                    f"DARK ENVIRONMENT (Luminance: {mean_frame_lum:.1f}/255) | Press [F] or turn on phone torch/light",
+                    (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.44,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
 
             cv2.imshow(config.WINDOW_TITLE, display_frame)
 
@@ -1089,6 +1138,13 @@ def run_cctv_recognition(
             if key in (ord("q"), ord("Q"), 27):
                 print("Disconnecting from CCTV camera and releasing resources...")
                 break
+            elif key in (ord("f"), ord("F")):
+                torch_state["enabled"] = not torch_state["enabled"]
+                target_state = torch_state["enabled"]
+                def _do_toggle():
+                    ok, msg = toggle_ipcamera_torch(rtsp_url, enable=target_state)
+                    print(f"\n[IP Camera Torch] {msg}")
+                threading.Thread(target=_do_toggle, daemon=True).start()
     finally:
         reader.disconnect()
         cv2.destroyAllWindows()
